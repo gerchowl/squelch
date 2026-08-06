@@ -1,0 +1,100 @@
+//! The crate's error type.
+
+use std::fmt;
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Debug)]
+pub enum Error {
+    /// No destination could be determined.
+    Destination(crate::destination::DestinationError),
+    /// A required form field was left empty.
+    MissingFields(Vec<String>),
+    /// A URL was refused before being handed to a platform opener.
+    UnsafeUrl(String),
+    /// A route that sends without a review surface was used without
+    /// [`crate::Report::confirmed`].
+    ConfirmationRequired(String),
+    Spawn {
+        program: String,
+        source: std::io::Error,
+    },
+    OpenerFailed(String),
+    Io(std::io::Error),
+    #[cfg(feature = "endpoint")]
+    Endpoint {
+        status: Option<u16>,
+        message: String,
+    },
+    /// Raised by an [`crate::Auth::Dynamic`] callback.
+    Auth(String),
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Destination(err) => write!(f, "{err}"),
+            Self::MissingFields(fields) => {
+                write!(f, "these sections are still empty: {}", fields.join(", "))
+            }
+            Self::UnsafeUrl(url) => write!(
+                f,
+                "refusing to open {url:?}: only https://github.com/ links are opened"
+            ),
+            Self::ConfirmationRequired(route) => write!(
+                f,
+                "this route would {route} without anyone reviewing it first; \
+                 call .confirmed() once the reporter has seen the preview"
+            ),
+            Self::Spawn { program, source } => write!(f, "could not run {program}: {source}"),
+            Self::OpenerFailed(status) => write!(f, "the browser opener failed: {status}"),
+            Self::Io(err) => write!(f, "{err}"),
+            #[cfg(feature = "endpoint")]
+            Self::Endpoint { status, message } => match status {
+                Some(code) => write!(f, "endpoint returned {code}: {message}"),
+                None => write!(f, "endpoint request failed: {message}"),
+            },
+            Self::Auth(message) => write!(f, "could not build credentials: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Destination(err) => Some(err),
+            Self::Spawn { source, .. } => Some(source),
+            Self::Io(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(err: std::io::Error) -> Self {
+        Self::Io(err)
+    }
+}
+
+impl From<crate::destination::DestinationError> for Error {
+    fn from(err: crate::destination::DestinationError) -> Self {
+        Self::Destination(err)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_fields_names_them() {
+        let err = Error::MissingFields(vec!["reproduction".into(), "impact".into()]);
+        assert!(err.to_string().contains("reproduction, impact"));
+    }
+
+    #[test]
+    fn confirmation_error_says_what_to_do() {
+        let err = Error::ConfirmationRequired("POST the report".into());
+        assert!(err.to_string().contains(".confirmed()"));
+    }
+}

@@ -1,0 +1,45 @@
+[package]
+name = "squelch"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Let your users file a genuinely useful bug report: collect environment, redact the logs, open a prefilled GitHub issue form"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/gerchowl/squelch"
+keywords = ["bug-report", "issue", "redaction", "github", "diagnostics"]
+categories = ["command-line-interface", "development-tools::debugging"]
+readme = "README.md"
+exclude = ["/.github", "/target"]
+
+[features]
+default = ["browser", "logs"]
+
+# Open the prefilled issue form in the user's browser.
+browser = []
+# Extract and redact structured (JSONL) log records.
+logs = ["dep:serde_json"]
+# Submit through a project-hosted HTTP endpoint. Pulls in a blocking HTTP
+# client — read the abuse warning on `Transport::Endpoint` before enabling.
+endpoint = ["dep:ureq"]
+# Submit with the `gh` CLI when it is installed and authenticated.
+gh-cli = []
+
+[dependencies]
+# The scrubber's rules. The one unconditional dependency: redaction is the
+# reason this crate exists, so it is not behind a feature flag.
+# Trimmed to what the patterns actually use. `unicode-case` is required by the
+# case-insensitive rules; ASCII-only folding (`(?i-u)`) was tried and rejected
+# because a negated ASCII class under `-u` can match invalid UTF-8, which the
+# crate refuses to compile.
+regex = { version = "1", default-features = false, features = ["std", "unicode-perl", "unicode-case"] }
+serde_json = { version = "1", optional = true }
+ureq = { version = "2", optional = true, default-features = false, features = ["tls", "json"] }
+
+# getpwuid, so the scrubber still knows the home directory and username when a
+# service manager strips HOME and USER from the environment. Unix-only; no cost
+# elsewhere.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+serde_json = "1"
