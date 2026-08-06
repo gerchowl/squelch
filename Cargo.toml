@@ -23,6 +23,10 @@ logs = ["dep:serde_json"]
 endpoint = ["dep:ureq"]
 # Submit with the `gh` CLI when it is installed and authenticated.
 gh-cli = []
+# Derive serde on the form model, so a consumer can load a Form from whatever
+# format they already use — YAML, JSON, TOML, RON. squelch takes no format
+# dependency of its own; you bring the deserializer.
+serde = ["dep:serde"]
 
 [dependencies]
 # The scrubber's rules. The one unconditional dependency: redaction is the
@@ -32,6 +36,7 @@ gh-cli = []
 # because a negated ASCII class under `-u` can match invalid UTF-8, which the
 # crate refuses to compile.
 regex = { version = "1", default-features = false, features = ["std", "unicode-perl", "unicode-case"] }
+serde = { version = "1", optional = true, features = ["derive"] }
 serde_json = { version = "1", optional = true }
 ureq = { version = "2", optional = true, default-features = false, features = ["tls", "json"] }
 
@@ -43,3 +48,10 @@ libc = "0.2"
 
 [dev-dependencies]
 serde_json = "1"
+
+[[example]]
+name = "file_a_bug"
+required-features = ["logs"]
+
+[package.metadata.docs.rs]
+all-features = true

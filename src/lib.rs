@@ -91,6 +91,7 @@
 //! | `logs` | yes | JSONL extraction (`serde_json`) |
 //! | `gh-cli` | no | create the issue with `gh`; no dependencies |
 //! | `endpoint` | no | POST to an endpoint you operate (`ureq`) |
+//! | `serde` | no | derive serde on [`Form`], so you can load it from YAML/JSON/TOML/RON with your own parser |
 //!
 //! With `default-features = false` the crate pulls only `regex`, and still
 //! redacts, builds URLs and renders bodies.
@@ -100,6 +101,7 @@
 
 pub mod destination;
 pub mod error;
+pub mod form;
 pub mod provenance;
 pub mod redact;
 pub mod report;
@@ -108,6 +110,7 @@ pub mod url;
 
 pub use destination::{Destination, DestinationError};
 pub use error::{Error, Result};
+pub use form::{Field, FieldKind, Form};
 pub use provenance::{Provenance, Value};
 pub use redact::{Record, Redactor};
 pub use report::{Composed, Report, Sent};

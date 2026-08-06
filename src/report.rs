@@ -2,6 +2,7 @@
 
 use crate::destination::Destination;
 use crate::error::{Error, Result};
+use crate::form::Form;
 use crate::provenance::Provenance;
 use crate::redact::{render_block, Record};
 use crate::transport::Transport;
@@ -18,6 +19,10 @@ pub struct Report {
     template: String,
     title: Option<String>,
     fields: Vec<(String, String)>,
+    /// Human labels per field id. GitHub's own form rendering emits
+    /// `### <label>`, so carrying the label lets a route that posts a body
+    /// produce an issue indistinguishable from a browser-submitted one.
+    labels: Vec<(String, String)>,
     required: Vec<String>,
     provenance: Option<Provenance>,
     provenance_field: String,
@@ -37,6 +42,7 @@ impl Report {
             template: "bug.yml".into(),
             title: None,
             fields: Vec::new(),
+            labels: Vec::new(),
             required: Vec::new(),
             provenance: None,
             provenance_field: "environment".into(),
@@ -62,6 +68,43 @@ impl Report {
         match self.fields.iter_mut().find(|(name, _)| *name == id) {
             Some((_, slot)) => *slot = value,
             None => self.fields.push((id, value)),
+        }
+        self
+    }
+
+    /// Adopt a [`Form`]: its template, labels, and required ids in one call.
+    ///
+    /// This is the seam that lets one composition serve a CLI, a GUI and an
+    /// agent tool. The surface renders or prompts from `form.prompts()`, hands
+    /// the answers back with [`Report::fields`], and everything else — which
+    /// fields are mandatory, what heading each answer gets, which template to
+    /// open — comes from the same definition rather than being restated per
+    /// surface and drifting.
+    pub fn form(mut self, form: &Form) -> Self {
+        if let Some(template) = &form.template {
+            self.template = template.clone();
+        }
+        for field in &form.fields {
+            if field.kind.is_answerable() {
+                self = self.label(field.id.clone(), field.label.clone());
+            }
+        }
+        self.required.extend(form.required_ids());
+        self
+    }
+
+    /// Give a field the human label GitHub's form shows for it.
+    ///
+    /// Verified against repositories using issue forms: a form submission
+    /// renders `### <label>` above each answer. Without the label a posted body
+    /// falls back to the field id, and maintainers get two visually different
+    /// issue shapes depending on which route the reporter used.
+    pub fn label(mut self, id: impl Into<String>, label: impl Into<String>) -> Self {
+        let id = id.into();
+        let label = label.into();
+        match self.labels.iter_mut().find(|(name, _)| *name == id) {
+            Some((_, slot)) => *slot = label,
+            None => self.labels.push((id, label)),
         }
         self
     }
@@ -178,7 +221,7 @@ impl Report {
             )
         });
 
-        let body = render_body(&values, diagnostics.as_deref());
+        let body = render_body(&values, &self.labels, diagnostics.as_deref());
 
         Ok(Composed {
             destination: self.destination.clone(),
@@ -344,10 +387,21 @@ pub enum Sent {
     Posted(String),
 }
 
-fn render_body(values: &[(&str, String)], diagnostics: Option<&str>) -> String {
+fn render_body(
+    values: &[(&str, String)],
+    labels: &[(String, String)],
+    diagnostics: Option<&str>,
+) -> String {
     let mut out = String::new();
     for (id, value) in values {
-        out.push_str(&format!("## {id}\n\n{}\n\n", value.trim_end()));
+        // `### <label>` is what GitHub emits for a form submission; falling
+        // back to the id keeps the body readable when no label was supplied.
+        let heading = labels
+            .iter()
+            .find(|(name, _)| name == id)
+            .map(|(_, label)| label.as_str())
+            .unwrap_or(id);
+        out.push_str(&format!("### {heading}\n\n{}\n\n", value.trim_end()));
     }
     if let Some(block) = diagnostics {
         out.push_str(block);
@@ -458,6 +512,37 @@ mod tests {
     fn credential_routes_refuse_without_confirmation() {
         let err = report().via(Transport::GhCli).send().expect_err("refuse");
         assert!(matches!(err, Error::ConfirmationRequired(_)));
+    }
+
+    #[test]
+    fn a_form_supplies_labels_template_and_required_ids() {
+        use crate::form::{Field, Form};
+
+        let form = Form::new([
+            Field::textarea("current-behavior", "Current behavior").required(),
+            Field::textarea("reproduction", "Reproduction").required(),
+        ])
+        .template("crash.yml");
+
+        // Only one of the two required fields is answered.
+        let report = Report::to(Destination::parse("gerchowl/squelch").unwrap())
+            .form(&form)
+            .field("current-behavior", "it crashes");
+
+        match report.build() {
+            Err(Error::MissingFields(missing)) => assert_eq!(missing, vec!["reproduction"]),
+            other => panic!("{other:?}"),
+        }
+
+        let composed = report.field("reproduction", "run twice").build().unwrap();
+        // The label from the form became the heading, matching GitHub's own
+        // rendering of a form submission.
+        assert!(
+            composed.body.contains("### Current behavior"),
+            "{}",
+            composed.body
+        );
+        assert!(composed.url.url.contains("template=crash.yml"));
     }
 
     #[test]

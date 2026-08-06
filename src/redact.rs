@@ -356,6 +356,10 @@ pub fn cap(value: &str) -> String {
     format!("{kept}…[truncated]")
 }
 
+/// Only reachable from the JSONL record path today, but it is the shared
+/// "make a value safe to render" step, so it stays next to its siblings rather
+/// than moving behind the feature gate.
+#[cfg_attr(not(feature = "logs"), allow(dead_code))]
 fn quote_if_spaced(value: &str) -> String {
     let value = sanitize_for_block(&cap(value));
     if value.contains(char::is_whitespace) {

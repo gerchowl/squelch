@@ -26,7 +26,10 @@
 
 use std::path::PathBuf;
 
-use crate::error::{Error, Result};
+#[cfg(any(feature = "browser", feature = "endpoint"))]
+use crate::error::Error;
+#[allow(unused_imports)]
+use crate::error::Result;
 
 /// Where to send a composed report.
 #[derive(Debug, Clone)]
@@ -53,13 +56,35 @@ pub enum Transport {
     /// A shared token compiled into the binary has a smaller blast radius than
     /// a GitHub token — it reaches only your endpoint, not your repository —
     /// but it is still extractable, and the end state is still spam.
+    ///
+    /// # Not available on wasm
+    ///
+    /// This route uses a blocking HTTP client, which `wasm32-unknown-unknown`
+    /// has no way to provide. In a browser or Tauri webview, compose with
+    /// squelch and POST with the platform's own fetch — the composed body and
+    /// destination are both public on [`crate::Composed`].
     #[cfg(feature = "endpoint")]
     Endpoint { url: String, auth: Auth },
 
-    /// Create the issue with the `gh` CLI, using the user's own credentials.
+    /// Create the issue with the `gh` CLI, using the reporter's own credentials.
     ///
-    /// Only sensible when the reporter is a contributor who already has `gh`
-    /// authenticated. Check with [`gh_available`] before offering it.
+    /// Not a contributor-only path — for anyone who already has `gh`
+    /// authenticated this is the *best* route, not a fallback. It files without
+    /// leaving the terminal: no browser launch, no context switch, no form to
+    /// re-read. Check [`gh_available`] and prefer it when it returns true.
+    ///
+    /// What it gives up versus [`Transport::Browser`] is smaller than it looks.
+    /// Required fields are already checked by `Report::require`, so the loss is
+    /// the template's confirmation checkbox, which `Report::confirmed` covers in
+    /// substance. Authorship stays correct because it is the reporter's own
+    /// token, and rate limiting lands on their account rather than a shared
+    /// relay — better than an endpoint on both counts.
+    ///
+    /// The token never enters this process: `gh` reads its own credential store
+    /// and makes the request. That is the reason this is a separate route
+    /// rather than [`Transport::Endpoint`] pointed at `api.github.com` with a
+    /// token from `gh auth token` — the latter would pull a personal access
+    /// token through a crate whose whole claim is that it carries none.
     #[cfg(feature = "gh-cli")]
     GhCli,
 
@@ -224,6 +249,29 @@ pub fn browser_available() -> bool {
     true
 }
 
+impl Transport {
+    /// The best route available on this machine, ranked by reporter effort.
+    ///
+    /// `gh` first — filing without leaving the terminal beats a browser round
+    /// trip — then a browser, then a file the reporter can attach. Never
+    /// selects [`Transport::Endpoint`], which needs a URL only the embedder
+    /// has.
+    ///
+    /// This probes the environment, so call it once and reuse the result.
+    /// Note that a route it picks may still require [`crate::Report::confirmed`]
+    /// before it will send.
+    pub fn best_available(fallback_file: impl Into<PathBuf>) -> Self {
+        #[cfg(feature = "gh-cli")]
+        if gh_available() {
+            return Self::GhCli;
+        }
+        if browser_available() {
+            return Self::Browser;
+        }
+        Self::File(fallback_file.into())
+    }
+}
+
 /// Whether `gh` is installed and authenticated.
 #[cfg(feature = "gh-cli")]
 pub fn gh_available() -> bool {
@@ -271,6 +319,13 @@ mod tests {
     fn auth_debug_never_prints_the_credential() {
         let auth = Auth::Bearer("super-secret-value".into());
         assert!(!format!("{auth:?}").contains("super-secret"));
+    }
+
+    #[test]
+    fn best_available_always_returns_something_usable() {
+        // Whatever the machine offers, there is always a route.
+        let route = Transport::best_available("/tmp/report.md");
+        assert!(!route.describe().is_empty());
     }
 
     #[test]
