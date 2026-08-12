@@ -96,6 +96,27 @@ fn a_report_missing_a_required_field_is_refused_before_anything_opens() {
     );
 }
 
+#[test]
+fn a_hostile_mail_address_cannot_start_its_own_query() {
+    // Spliced raw, the FIRST `?` in the URL belonged to the address, so a mail
+    // client splitting there prefills the attacker's body and the report is
+    // silently discarded.
+    let dir = scratch("mailto-inject");
+    let (ok, stdout, _) = compose(&dir, &["mailto", "bugs@example.com?body=fake&x=y"]);
+    assert!(ok);
+    let after_scheme = stdout.split("mailto:").nth(1).expect("a mailto url").trim();
+    let first_query = after_scheme.find('?').expect("a query separator");
+    let address = &after_scheme[..first_query];
+    assert!(
+        !address.contains("body=fake"),
+        "the address carried its own query: {address}"
+    );
+    assert!(
+        after_scheme[first_query..].starts_with("?subject="),
+        "the first query component must be ours: {after_scheme}"
+    );
+}
+
 /// Minimal `%XX` decoder — enough to unmask a leak hiding behind encoding.
 fn percent_decode(input: &str) -> String {
     let bytes = input.as_bytes();

@@ -72,10 +72,24 @@ impl Destination {
         let value = value.trim().trim_end_matches('/');
         let value = value.strip_suffix(".git").unwrap_or(value);
 
-        let tail = value
-            .rsplit_once("github.com")
-            .map(|(_, tail)| tail.trim_start_matches(['/', ':']))
-            .unwrap_or(value);
+        // The host must BE github.com, not merely contain it. `rsplit_once`
+        // matched any occurrence, so `evil-github.com/x/y` and
+        // `https://gitlab.com/a/b/github.com/x/y` both resolved to `x/y` — a
+        // consumer taking a destination from configuration could be pointed at
+        // one host and silently file against another.
+        let tail = match value.rsplit_once("github.com") {
+            Some((head, tail)) => {
+                let host_starts_here = head.is_empty()
+                    || head.ends_with("://")
+                    || head.ends_with('@')
+                    || head.ends_with('.');
+                if !host_starts_here {
+                    return None;
+                }
+                tail.trim_start_matches(['/', ':'])
+            }
+            None => value,
+        };
 
         let mut parts = tail.split('/').filter(|part| !part.is_empty());
         let owner = parts.next()?;
@@ -85,7 +99,14 @@ impl Destination {
         }
 
         let valid = |part: &str, max: usize| {
+            // `.` and `..` are path traversal, not names. They parsed cleanly
+            // and produced `https://github.com/owner/../issues/new`, which the
+            // browser normalises to a different repository — or to GitHub's
+            // own new-issue form. The report goes somewhere nobody is looking,
+            // and nothing reports an error.
             !part.is_empty()
+                && part != "."
+                && part != ".."
                 && part.len() <= max
                 && part
                     .chars()
@@ -162,5 +183,41 @@ mod tests {
             Destination::from_cargo_repository(Some("  ")),
             Err(DestinationError::Unknown)
         );
+    }
+
+    #[test]
+    fn traversal_segments_are_not_repository_names() {
+        // `owner/..` built https://github.com/owner/../issues/new, which the
+        // browser normalises to a different repository. The report lands
+        // somewhere nobody is watching and nothing reports an error.
+        for hostile in ["owner/..", "owner/.", "../repo", "./repo"] {
+            assert!(
+                Destination::parse(hostile).is_err(),
+                "{hostile:?} must be rejected, not silently misrouted"
+            );
+        }
+    }
+
+    #[test]
+    fn the_host_must_be_github_not_merely_contain_it() {
+        for hostile in [
+            "evil-github.com/x/y",
+            "https://gitlab.com/a/b/github.com/x/y",
+            "notgithub.com/x/y",
+        ] {
+            assert!(
+                Destination::parse(hostile).is_err(),
+                "{hostile:?} resolved to a github repository it never named"
+            );
+        }
+        // The real forms still parse.
+        for good in [
+            "https://github.com/o/r",
+            "git@github.com:o/r.git",
+            "o/r",
+            "https://www.github.com/o/r",
+        ] {
+            assert!(Destination::parse(good).is_ok(), "{good:?} must parse");
+        }
     }
 }

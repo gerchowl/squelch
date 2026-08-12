@@ -290,8 +290,13 @@ impl Report {
                     .title
                     .clone()
                     .unwrap_or_else(|| "Bug report".into());
+                // Spliced raw, a `to` of `bugs@example.com?body=fake` produced
+                // a URL whose FIRST `?` belongs to the attacker, so a mail
+                // client splitting there prefills their body and drops the
+                // report entirely.
                 Ok(Sent::Mailto(format!(
-                    "mailto:{to}?subject={}&body={}",
+                    "mailto:{}?subject={}&body={}",
+                    percent_address(to),
                     percent(&subject),
                     percent(&composed.body)
                 )))
@@ -414,6 +419,25 @@ fn render_body(
     }
     if let Some(block) = diagnostics {
         out.push_str(block);
+    }
+    out
+}
+
+/// Percent-encode a mail address, keeping the characters an address is made
+/// of so an ordinary one is unchanged.
+///
+/// `percent` is wrong here: it escapes `@`, which mangles every real address.
+/// What has to be escaped is anything that could end the address and start a
+/// new URL component — `?`, `&`, `#`, whitespace — per RFC 6068's addr-spec.
+fn percent_address(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' => out.push(*byte as char),
+            b'-' | b'_' | b'.' | b'~' | b'@' | b'+' | b'!' | b'$' | b'*' | b'\'' | b'(' | b')'
+            | b',' | b';' | b':' => out.push(*byte as char),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
     }
     out
 }

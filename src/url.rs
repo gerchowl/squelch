@@ -119,7 +119,22 @@ fn encode(value: &str) -> String {
 /// is not plainly an `https://github.com/` URL rather than trusting the caller
 /// to have got the separator right.
 pub fn is_safe_to_open(url: &str) -> bool {
-    url.starts_with("https://github.com/") && !url.contains(['\n', '\r', '\0', ' ', '"', '\''])
+    // The gate exists because a platform opener may treat argv without a `--`
+    // separator specially, so the deny-set has to cover everything a shell or a
+    // JS-based opener could act on — not only the obvious whitespace. Tab and
+    // NBSP are word-splittable, backslash and backtick carry shell meaning, and
+    // U+2028/U+2029 terminate a line for a JavaScript parser.
+    //
+    // An allowlist would be stricter still, but a GitHub prefill URL legitimately
+    // carries percent-escapes, `&`, `=` and `?`, so the useful distinction here
+    // is exactly "characters an opener might interpret".
+    url.starts_with("https://github.com/")
+        && !url.chars().any(|c| {
+            c.is_control()
+                || c.is_whitespace()
+                || matches!(c, '"' | '\'' | '`' | '\\' | '$' | '|' | ';' | '<' | '>')
+                || matches!(c, '\u{2028}' | '\u{2029}' | '\u{00a0}' | '\u{feff}')
+        })
 }
 
 #[cfg(test)]
@@ -212,5 +227,26 @@ mod tests {
         ] {
             assert!(!is_safe_to_open(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn the_opener_gate_rejects_everything_an_opener_could_interpret() {
+        // The gate's justification is that a platform opener may treat argv
+        // specially without a `--`. That claim needs more than the obvious
+        // whitespace: these all passed before.
+        let base = "https://github.com/o/r";
+        for bad in [
+            "\t", "\\", "$HOME", "`x`", "\u{000b}", "\u{007f}", "\u{2028}", "\u{2029}", "\u{00a0}",
+            "|x", ";x", "<x", ">x",
+        ] {
+            let url = format!("{base}{bad}");
+            assert!(
+                !is_safe_to_open(&url),
+                "{bad:?} should not survive the opener gate"
+            );
+        }
+        assert!(is_safe_to_open(
+            "https://github.com/o/r/issues/new?template=bug.yml&a=b%20c"
+        ));
     }
 }
