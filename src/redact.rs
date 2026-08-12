@@ -967,4 +967,178 @@ mod tests {
             assert_eq!(redactor.scrub(input), expected, "{input:?}");
         }
     }
+
+    /// Assert that nothing recognisable from `secret` survives.
+    ///
+    /// Comparing against an exact expected string would pass while the rule
+    /// masked only a prefix — which is how the git-remote hole stayed open:
+    /// `git@github.com:org/private.git` matched as an email, so the address
+    /// went and the org and repository were published in the tail.
+    fn assert_gone(redactor: &Redactor, input: &str, secret: &str) {
+        let out = redactor.scrub(input);
+        assert!(
+            !out.contains(secret),
+            "{secret:?} survived redaction of {input:?}: {out}"
+        );
+    }
+
+    #[test]
+    fn private_key_armour_is_masked() {
+        // `(?x)` strips whitespace INSIDE a character class in this engine, so
+        // `[A-Z ]*` compiled as `[A-Z]*` and the rule only ever matched
+        // `-----BEGINPRIVATE KEY-----`, which nothing emits. Every real key
+        // header went through untouched, and the base64 body after it matches
+        // no other rule.
+        let redactor = redactor();
+        for armour in [
+            "-----BEGIN PRIVATE KEY-----",
+            "-----BEGIN RSA PRIVATE KEY-----",
+            "-----BEGIN OPENSSH PRIVATE KEY-----",
+            "-----BEGIN EC PRIVATE KEY-----",
+        ] {
+            assert_gone(&redactor, armour, "PRIVATE KEY");
+        }
+    }
+
+    #[test]
+    fn forge_urls_lose_the_org_and_repository_without_a_dot_git() {
+        // The rule required a trailing `.git`, which is the one form a human
+        // reading an error message rarely sees. `fatal: repository
+        // 'https://github.com/acme/prod-vault/' not found` is what git
+        // actually prints, and the private repository name rode out in it.
+        let redactor = redactor();
+        for input in [
+            "See https://github.com/acmecorp/prod-vault",
+            "https://github.com/acmecorp/prod-vault/pull/42",
+            "https://gitlab.com/acmecorp/prod-vault/-/tree/main",
+            "repository 'https://github.com/acmecorp/prod-vault/' not found",
+            // Case in the scheme was enough to defeat it even WITH the `.git`.
+            "at HTTPS://github.com/acmecorp/prod-vault.git",
+        ] {
+            assert_gone(&redactor, input, "acmecorp");
+            assert_gone(&redactor, input, "prod-vault");
+        }
+    }
+
+    #[test]
+    fn credential_shapes_the_pattern_list_had_missed() {
+        let redactor = redactor();
+        for (input, secret) in [
+            // Firebase / Maps / Cloud. A single very common shape, absent.
+            (
+                "key AIzaSyD-1234567890abcdefghijklmnopqrstu",
+                "AIzaSyD-1234567890abcdefghijklmnopqrstu",
+            ),
+            // Slack app-level (Socket Mode). Only `xox[baprs]-` was listed.
+            (
+                "xapp-1-A00000000-1234567890-abcdefabcdefabcdef",
+                "xapp-1-A00000000",
+            ),
+            (
+                "bot 123456789:AAG1234567890abcdefghijklmnopqrstuv",
+                "AAG1234567890abcdefghijklmnopqrstuv",
+            ),
+        ] {
+            assert_gone(&redactor, input, secret);
+        }
+    }
+
+    #[test]
+    fn windows_and_unc_paths_name_no_account() {
+        // The rule required a drive letter. A relative `Users\bob\...` is what
+        // a stack trace prints, and a UNC path names both the file server and
+        // the account.
+        let redactor = redactor();
+        assert_gone(&redactor, r"at Users\bob\Documents\Diary.txt", "bob");
+        assert_gone(&redactor, r"\\fileserver\share\alice\q.docx", "alice");
+        assert_gone(&redactor, r"\\fileserver\share\alice\q.docx", "fileserver");
+    }
+
+    #[test]
+    fn hardware_addresses_are_masked() {
+        let redactor = redactor();
+        // Colon-form MACs are already caught, but incidentally — they collide
+        // with the IPv6 rule. Dash-form had nothing.
+        assert_gone(&redactor, "iface aa-bb-cc-dd-ee-ff up", "aa-bb-cc-dd-ee-ff");
+        assert_gone(&redactor, "iface aa:bb:cc:dd:ee:ff up", "aa:bb:cc:dd:ee:ff");
+    }
+
+    #[test]
+    fn labelled_machine_identifiers_are_masked() {
+        // A bare UUID stays: request and trace ids are UUIDs, they are the
+        // thread a maintainer follows through a log, and masking them costs
+        // the report its correlation. A *labelled* one is a different claim
+        // about the same bytes.
+        let redactor = redactor();
+        for input in [
+            "machine-id 550e8400-e29b-41d4-a716-446655440000",
+            "device_id=550e8400-e29b-41d4-a716-446655440000",
+            "serial number C02XG2JMJGH8",
+        ] {
+            let out = redactor.scrub(input);
+            assert!(
+                !out.contains("550e8400") && !out.contains("C02XG2JMJGH8"),
+                "{input:?} kept its identifier: {out}"
+            );
+        }
+        let trace = "request 550e8400-e29b-41d4-a716-446655440000 failed";
+        assert_eq!(
+            redactor.scrub(trace),
+            trace,
+            "an unlabelled UUID is a correlation id and must survive"
+        );
+    }
+
+    #[test]
+    fn dotted_module_paths_are_not_hostnames() {
+        // The four-label rule masked any all-lowercase dotted run ending in
+        // letters, which is the exact shape of a Python, Java or Kotlin stack
+        // frame. Every Django traceback lost the line that says where the bug
+        // is — and a log block scrubbed into uselessness costs the maintainer
+        // the same round trip as no log block at all.
+        let redactor = redactor();
+        for path in [
+            "django.contrib.auth.models",
+            "django.contrib.auth.models.User.save",
+            "org.jetbrains.kotlin.compiler.plugin",
+            "boto3.session.session.client",
+            "server.log.old.tmp",
+            "webpack.config.prod.js",
+            "std::collections::HashMap",
+            "java.lang.Thread.run",
+        ] {
+            assert_eq!(redactor.scrub(path), path, "mangled a module path");
+        }
+    }
+
+    #[test]
+    fn real_hostnames_are_still_masked_whole() {
+        let redactor = redactor();
+        for (input, kept) in [
+            ("could not resolve bastion.internal.acme.corp", "acme"),
+            // The private-suffix alternative stopped at `corp` and left the
+            // rest, so the interesting half of the name was published.
+            ("could not resolve bastion.corp.acme-inc.com", "acme-inc"),
+            ("could not resolve db01.prod.acme-inc.com", "acme-inc"),
+            ("could not resolve db01.prod.acme-inc.co.uk", "acme-inc"),
+        ] {
+            assert_gone(&redactor, input, kept);
+        }
+    }
+
+    #[test]
+    fn git_revisions_are_not_home_directories() {
+        // `~[A-Za-z0-9._-]+` had no left boundary, so every tilde-suffixed
+        // git revision in a command line became `<path>`.
+        let redactor = redactor();
+        for input in [
+            "git reset --hard HEAD~1",
+            "git log HEAD~3..HEAD",
+            "rebase onto main~2",
+        ] {
+            assert_eq!(redactor.scrub(input), input, "mangled a git revision");
+        }
+        // …while the thing the rule is actually for still goes.
+        assert_gone(&redactor, "cat ~someone/.bashrc", "someone");
+    }
 }
