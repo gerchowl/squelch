@@ -20,6 +20,9 @@ pub enum Error {
         source: std::io::Error,
     },
     OpenerFailed(String),
+    /// The prefilled URL could not carry these fields, so opening the form
+    /// would submit a report missing whole sections.
+    FieldsDropped(Vec<String>),
     Io(std::io::Error),
     #[cfg(feature = "endpoint")]
     Endpoint {
@@ -40,6 +43,13 @@ impl fmt::Display for Error {
             Self::MissingFields(fields) => {
                 write!(f, "these sections are still empty: {}", fields.join(", "))
             }
+            Self::FieldsDropped(fields) => write!(
+                f,
+                "too long for a browser link — these sections would not reach \
+                 GitHub: {}. Use a route that carries the whole report \
+                 (a file, mail, `gh`, or your endpoint), or shorten them",
+                fields.join(", ")
+            ),
             Self::UnsafeUrl(url) => write!(
                 f,
                 "refusing to open {url:?}: only https://github.com/ links are opened"

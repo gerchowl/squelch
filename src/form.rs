@@ -180,6 +180,23 @@ impl Form {
     /// Guidance rides in HTML comments so it can be left in place and still be
     /// stripped on the way back by [`Form::parse_skeleton`].
     pub fn skeleton(&self) -> String {
+        // Guidance rides in an HTML comment, so any text interpolated into it
+        // must not be able to close it. A description containing `-->` ended
+        // the comment early and the remainder rendered as literal text in the
+        // reporter's editor; a description containing a newline escaped it
+        // entirely and became content in the parsed answer.
+        //
+        // Escaped rather than re-mechanised. Switching to git's `#`-prefixed
+        // convention was considered and rejected: with `## <id>` as the heading
+        // syntax, stripping `# ` lines would silently swallow a reporter's own
+        // markdown headings — the same silent-loss failure this guards against.
+        fn guidance(text: &str) -> String {
+            let flattened: String = text
+                .chars()
+                .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+                .collect();
+            flattened.replace("-->", "--\u{200b}>")
+        }
         let mut out = String::new();
         for field in &self.fields {
             match &field.kind {
@@ -187,21 +204,21 @@ impl Form {
                 FieldKind::Checkboxes { .. } => {
                     out.push_str(&format!(
                         "\n<!-- \"{}\" is confirmed by you, not by this tool. -->\n",
-                        field.label
+                        guidance(&field.label)
                     ));
                 }
                 _ if field.machine_filled => {
                     out.push_str(&format!(
                         "\n<!-- \"{}\" is filled in automatically. -->\n",
-                        field.label
+                        guidance(&field.label)
                     ));
                 }
                 _ => {
                     out.push_str(&format!("\n## {}\n", field.id));
                     if let Some(description) = &field.description {
-                        out.push_str(&format!("<!-- {description} -->\n"));
+                        out.push_str(&format!("<!-- {} -->\n", guidance(description)));
                     } else {
-                        out.push_str(&format!("<!-- {} -->\n", field.label));
+                        out.push_str(&format!("<!-- {} -->\n", guidance(&field.label)));
                     }
                     out.push('\n');
                 }
@@ -671,5 +688,38 @@ mod tests {
             "the real section was emptied: {parsed:?}"
         );
         assert!(!parsed.iter().any(|(id, _)| id == "indented"), "{parsed:?}");
+    }
+
+    #[test]
+    fn a_description_cannot_close_the_comment_it_rides_in() {
+        // `-->` inside guidance ended the comment early, so the rest rendered
+        // as literal text in the reporter's editor — and a newline escaped it
+        // altogether, turning guidance into the reporter's answer.
+        let form =
+            Form::new([Field::textarea("repro", "Repro")
+                .describe("hostile --> escape\nand a newline --> too")]);
+        let skeleton = form.skeleton();
+
+        let guidance: Vec<&str> = skeleton
+            .lines()
+            .filter(|line| line.trim_start().starts_with("<!--"))
+            .collect();
+        assert_eq!(guidance.len(), 1, "guidance split across lines: {skeleton}");
+        assert_eq!(
+            guidance[0].matches("-->").count(),
+            1,
+            "the comment is closed more than once: {skeleton}"
+        );
+
+        // And the reporter's own answer is unaffected by it.
+        let filled = skeleton.replace("## repro\n", "## repro\nit crashes\n");
+        let parsed = Form::parse_skeleton(&filled);
+        assert_eq!(
+            parsed
+                .iter()
+                .find(|(id, _)| id == "repro")
+                .map(|(_, value)| value.as_str()),
+            Some("it crashes")
+        );
     }
 }

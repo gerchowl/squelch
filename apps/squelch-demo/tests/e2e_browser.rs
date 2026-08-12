@@ -14,7 +14,7 @@
 mod common;
 
 use common::{
-    assert_nothing_leaked, canary_log_file, run_demo_with, scratch, Shim, BROWSER_OPENER,
+    assert_nothing_leaked, canary_log_file, run_demo, run_demo_with, scratch, Shim, BROWSER_OPENER,
     CANARY_WORKDIR,
 };
 
@@ -82,4 +82,52 @@ fn the_browser_route_needs_no_confirmation() {
     let (ok, _, stderr) = run_demo_with(&shim, &["browser"]);
     assert!(ok, "the default route must work unconfirmed: {stderr}");
     assert!(shim.was_called(), "the opener was never invoked");
+}
+
+#[test]
+fn the_browser_route_refuses_rather_than_open_a_form_missing_a_section() {
+    // End-to-end version of the contract this crate is named for: the reporter
+    // approves a preview showing every section, so opening a form that silently
+    // lacks one means they consented to something that never arrived — and the
+    // maintainer closes an issue whose Reproduction section is blank.
+    let shim = Shim::install(BROWSER_OPENER, 0);
+    let huge = "x".repeat(40_000);
+
+    let (ok, stdout, stderr) = run_demo_with(
+        &shim,
+        &["--current", &huge, "--repro", "run it twice", "browser"],
+    );
+    assert!(!ok, "the browser route must refuse: stdout={stdout}");
+    assert!(
+        !shim.was_called(),
+        "no browser may be opened for a report that cannot be carried whole"
+    );
+    assert!(
+        stderr.contains("reproduction"),
+        "the refusal must name the section that would be missing: {stderr}"
+    );
+}
+
+#[test]
+fn a_route_that_carries_the_whole_report_is_unaffected() {
+    // The report is fine; it is the URL that cannot hold it. Refusing the
+    // browser must not make the report unfileable.
+    let dir = common::scratch("oversized-file");
+    let out = dir.join("report.md");
+    let huge = "x".repeat(40_000);
+
+    let (ok, _, stderr) = run_demo(&[
+        "--current",
+        &huge,
+        "--repro",
+        "run it twice",
+        "file",
+        out.to_str().unwrap(),
+    ]);
+    assert!(ok, "the file route must still work: {stderr}");
+    let written = std::fs::read_to_string(&out).expect("report written");
+    assert!(
+        written.contains("run it twice"),
+        "the whole report must reach the file"
+    );
 }

@@ -27,9 +27,30 @@ pub const MAX_URL_LEN: usize = 7_500;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrefilledUrl {
     pub url: String,
-    /// Some text was shortened to fit. The caller **must** say so out loud —
-    /// a silently truncated report reads as complete.
-    pub truncated: bool,
+    /// Fields whose value was cut short to fit, in the order they were given.
+    ///
+    /// Routine: a long log tail is expected to be trimmed, and the reporter
+    /// never expected to see all of it. Kept separate from [`Self::dropped`]
+    /// deliberately — reporting both under one flag meant the warning fired on
+    /// almost every report, which trains a reporter to ignore it on the one
+    /// occasion it matters.
+    pub shortened: Vec<String>,
+    /// Fields that did not reach the URL **at all**.
+    ///
+    /// Not a worse kind of shortening — a different kind of event. A trimmed
+    /// log still leaves a stub the reporter can recognise; a dropped field
+    /// means they review a preview containing a section that is then simply
+    /// absent from the form they submit. That changes what the report means,
+    /// to both the reporter and the maintainer, so it is reported by name and
+    /// refused rather than counted.
+    pub dropped: Vec<String>,
+}
+
+impl PrefilledUrl {
+    /// Whether anything at all failed to survive intact.
+    pub fn is_lossy(&self) -> bool {
+        !self.shortened.is_empty() || !self.dropped.is_empty()
+    }
 }
 
 /// Build a prefilled issue-form URL.
@@ -49,7 +70,8 @@ pub fn build(destination: &Destination, template: &str, fields: &[(&str, String)
 
     let mut budget = MAX_URL_LEN.saturating_sub(base.len());
     let mut query = String::new();
-    let mut truncated = false;
+    let mut shortened: Vec<String> = Vec::new();
+    let mut dropped: Vec<String> = Vec::new();
 
     for (id, value) in fields {
         if value.trim().is_empty() {
@@ -61,12 +83,15 @@ pub fn build(destination: &Destination, template: &str, fields: &[(&str, String)
             const NOTE: &str = "\n\n[shortened — the full text was not sent]";
             let room = budget.saturating_sub(prefix.len() + encode(NOTE).len());
             if room == 0 {
-                truncated = true;
+                // The field is gone, not merely shorter. Recorded by name: the
+                // body still contains it, so without this nothing downstream
+                // can tell the reporter which section will be missing.
+                dropped.push((*id).to_string());
                 continue;
             }
             encoded = truncate_encoded(&encoded, room);
             encoded.push_str(&encode(NOTE));
-            truncated = true;
+            shortened.push((*id).to_string());
         }
         budget = budget.saturating_sub(prefix.len() + encoded.len());
         query.push_str(&prefix);
@@ -75,7 +100,8 @@ pub fn build(destination: &Destination, template: &str, fields: &[(&str, String)
 
     PrefilledUrl {
         url: format!("{base}{query}"),
-        truncated,
+        shortened,
+        dropped,
     }
 }
 
@@ -160,7 +186,7 @@ mod tests {
             .starts_with("https://github.com/gerchowl/squelch/issues/new?template=bug.yml"));
         assert!(built.url.contains("&current-behavior=panes%20freeze"));
         assert!(built.url.contains("%60app%60"), "{}", built.url);
-        assert!(!built.truncated);
+        assert!(!built.is_lossy());
     }
 
     #[test]
@@ -181,7 +207,8 @@ mod tests {
             "bug.yml",
             &[("current-behavior", "x".repeat(40_000))],
         );
-        assert!(built.truncated);
+        assert_eq!(built.shortened, vec!["current-behavior".to_string()]);
+        assert!(built.dropped.is_empty(), "nothing should have been dropped");
         assert!(built.url.len() <= MAX_URL_LEN, "{} chars", built.url.len());
         assert!(built.url.contains("shortened"));
     }
@@ -195,7 +222,38 @@ mod tests {
         ];
         let built = build(&destination(), "bug.yml", &fields);
         assert!(built.url.len() <= MAX_URL_LEN, "{} chars", built.url.len());
-        assert!(built.truncated);
+        assert!(built.is_lossy());
+        // Whichever fields lost text must be named, and a field can only be in
+        // one bucket: the body still carries every one of them, so a caller
+        // reconciling body against URL needs the accounting to be exact.
+        for id in built.shortened.iter().chain(built.dropped.iter()) {
+            assert!(["a", "b", "c"].contains(&id.as_str()), "unexpected id {id}");
+        }
+        for id in &built.shortened {
+            assert!(!built.dropped.contains(id), "{id} is in both buckets");
+        }
+    }
+
+    #[test]
+    fn a_field_squeezed_out_entirely_is_named_not_merely_counted() {
+        // The failure this exists for: an early field eats the budget and a
+        // later one vanishes from the URL while the body still contains it.
+        // Reported by name, or no surface can tell the reporter which section
+        // will be missing from the form they are about to submit.
+        let built = build(
+            &destination(),
+            "bug.yml",
+            &[
+                ("current-behavior", "x".repeat(40_000)),
+                ("reproduction", "run it twice".to_string()),
+            ],
+        );
+        assert_eq!(built.dropped, vec!["reproduction".to_string()]);
+        assert!(
+            !built.url.contains("&reproduction="),
+            "a dropped field must not appear in the URL: {}",
+            built.url
+        );
     }
 
     #[test]

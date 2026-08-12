@@ -89,7 +89,7 @@ impl Report {
                 self = self.label(field.id.clone(), field.label.clone());
             }
         }
-        self.required.extend(form.required_ids());
+        self = self.require(form.required_ids());
         self
     }
 
@@ -133,7 +133,15 @@ impl Report {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        self.required.extend(ids.into_iter().map(Into::into));
+        for id in ids {
+            let id = id.into();
+            // Deduped on insert. Both this and `form` used to extend blindly,
+            // so a GUI re-applying its form per keystroke accumulated ids and
+            // `MissingFields` came back as ["a","b","a","b"].
+            if !self.required.contains(&id) {
+                self.required.push(id);
+            }
+        }
         self
     }
 
@@ -262,11 +270,22 @@ impl Report {
             self.transport.describe()
         );
         out.push_str(&composed.body);
-        if composed.url.truncated {
-            out.push_str(
-                "\n! some text was shortened to fit GitHub's URL limit — \
-                 the full text is NOT in the link\n",
-            );
+        // The alarm is reserved for whole-field loss. It used to fire whenever
+        // anything was shortened, which for a long log tail is nearly always —
+        // and a warning that fires on almost every report teaches the reporter
+        // to skip it on the one occasion it matters.
+        if !composed.url.dropped.is_empty() {
+            out.push_str(&format!(
+                "\n! this report is too long to send through the browser, so \
+                 these sections would NOT reach GitHub: {}\n  \
+                 send it another way, or shorten what you wrote.\n",
+                composed.url.dropped.join(", ")
+            ));
+        } else if !composed.url.shortened.is_empty() {
+            out.push_str(&format!(
+                "\n(some text was shortened to fit the link: {})\n",
+                composed.url.shortened.join(", ")
+            ));
         }
         Ok(out)
     }
@@ -281,6 +300,21 @@ impl Report {
 
         match &self.transport {
             Transport::Browser => {
+                // Refuse rather than open a form the reporter has already
+                // approved in a preview that showed MORE than will arrive.
+                // Showing less than leaves is a privacy failure; showing more
+                // corrupts what the reporter believes they consented to send,
+                // and the maintainer closes an issue whose Reproduction
+                // section is simply blank.
+                //
+                // Refused here rather than in `build`, because `build` is
+                // route-agnostic: a File or Mailto report carries the whole
+                // body and is perfectly valid. The crate also does not pick a
+                // fallback route itself — which route to use is the surface's
+                // decision (docs/stories.md).
+                if !composed.url.dropped.is_empty() {
+                    return Err(Error::FieldsDropped(composed.url.dropped.clone()));
+                }
                 #[cfg(feature = "browser")]
                 {
                     crate::transport::open_in_browser(&composed.url.url)?;
@@ -633,5 +667,76 @@ mod tests {
             "the body carries two Environment sections: {}",
             composed.body
         );
+    }
+
+    #[test]
+    fn applying_the_same_form_twice_changes_nothing() {
+        use crate::form::{Field, Form};
+
+        // A GUI re-applies its form on every keystroke. Both `form` and
+        // `require` used to extend blindly, so required ids accumulated and
+        // `MissingFields` came back as ["a","b","a","b"] — confusing, and
+        // O(n^2) over a session.
+        let form = Form::new([
+            Field::textarea("current-behavior", "Current behavior").required(),
+            Field::textarea("reproduction", "Reproduction").required(),
+        ]);
+        let once = Report::to(Destination::parse("gerchowl/squelch").unwrap()).form(&form);
+        let twice = Report::to(Destination::parse("gerchowl/squelch").unwrap())
+            .form(&form)
+            .form(&form);
+
+        let missing = |report: &Report| match report.build() {
+            Err(Error::MissingFields(fields)) => fields,
+            other => panic!("expected MissingFields, got {other:?}"),
+        };
+        assert_eq!(missing(&once), missing(&twice));
+        assert_eq!(missing(&twice), vec!["current-behavior", "reproduction"]);
+    }
+
+    #[test]
+    fn the_browser_route_refuses_a_report_it_cannot_carry_whole() {
+        // The reporter approves a preview showing every section, so opening a
+        // form that silently lacks one breaks the only promise the tool makes.
+        let report = report()
+            .field("current-behavior", "x".repeat(40_000))
+            .field("reproduction", "run it twice")
+            .via(Transport::Browser);
+
+        match report.send() {
+            Err(Error::FieldsDropped(fields)) => {
+                assert_eq!(fields, vec!["reproduction".to_string()]);
+            }
+            other => panic!("browser send must refuse a mutilated payload: {other:?}"),
+        }
+
+        // A route that carries the whole body is unaffected — the report is
+        // fine, it is the URL that cannot hold it.
+        let path = std::env::temp_dir().join(format!("squelch-drop-{}.md", std::process::id()));
+        let sent = report.via(Transport::File(path.clone())).send();
+        assert!(sent.is_ok(), "the file route must still work: {sent:?}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_preview_names_dropped_sections_and_stays_quiet_about_trimming() {
+        let dropped = report()
+            .field("current-behavior", "x".repeat(40_000))
+            .field("reproduction", "run it twice")
+            .preview()
+            .unwrap();
+        assert!(dropped.contains("would NOT reach GitHub"), "{dropped}");
+        assert!(dropped.contains("reproduction"), "{dropped}");
+
+        // Shortening alone is routine. It gets a parenthetical, not an alarm —
+        // a warning that fires on every long log is one nobody reads.
+        // A fresh report with ONE field: the helper above sets two, and a
+        // second field would be dropped rather than shortened.
+        let shortened = Report::to(Destination::parse("gerchowl/squelch").unwrap())
+            .field("current-behavior", "x".repeat(40_000))
+            .preview()
+            .unwrap();
+        assert!(!shortened.contains("would NOT reach GitHub"), "{shortened}");
+        assert!(shortened.contains("shortened to fit"), "{shortened}");
     }
 }
