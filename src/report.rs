@@ -340,11 +340,17 @@ impl Report {
                 // a URL whose FIRST `?` belongs to the attacker, so a mail
                 // client splitting there prefills their body and drops the
                 // report entirely.
+                // `composed.body` and not a subset: mail is a body route.
+                // README and `Error::FieldsDropped` both point a reporter
+                // whose report was too long for the browser link at "a file,
+                // mail, `gh`, or your endpoint", so this one has to carry the
+                // whole thing — diagnostics included — or that advice is a
+                // dead end.
                 Ok(Sent::Mailto(format!(
                     "mailto:{}?subject={}&body={}",
                     percent_address(to),
                     percent(&subject),
-                    percent("")
+                    percent(&composed.body)
                 )))
             }
             Transport::File(path) => {
@@ -581,7 +587,42 @@ mod tests {
             Sent::Mailto(url) => {
                 assert!(url.starts_with("mailto:bugs@example.com?"));
                 assert!(url.contains("subject=crash%20on%20split"));
+                // The whole point of the route. This test was named
+                // `..._encodes_the_body` while asserting only the subject, so
+                // when the body was replaced with `percent("")` in a stray
+                // edit it stayed green — a draft with an address, a subject,
+                // and nothing to send.
+                assert!(
+                    url.contains(&percent("it crashes")),
+                    "the composed body must be in the draft: {url}"
+                );
             }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn mailto_carries_the_whole_report_including_diagnostics() {
+        // README and `Error::FieldsDropped`'s own text both send a reporter
+        // whose report was too long for the browser link to "a file, mail,
+        // `gh`, or your endpoint" — the routes that carry it whole. Mail has
+        // to actually be one of those or that advice sends them nowhere.
+        let sent = report()
+            .diagnostics([Record {
+                timestamp: "2026-08-12T00:00:00Z".into(),
+                level: "error".into(),
+                source: None,
+                fields: vec![("message".into(), "zzmarkerzz".into())],
+            }])
+            .via(Transport::Mailto("bugs@example.com".into()))
+            .send()
+            .unwrap();
+        match sent {
+            Sent::Mailto(url) => assert!(
+                url.contains(&percent("zzmarkerzz")),
+                "diagnostics are excluded from the GitHub URL by design, but \
+                 mail is a body route and carries them: {url}"
+            ),
             other => panic!("{other:?}"),
         }
     }
