@@ -281,7 +281,7 @@ impl Redactor {
         for (pattern, replacement) in [
             (git_remote_re(), "<git-remote>"),
             (secret_token_re(), "<redacted-token>"),
-            (labeled_secret_re(), "$1=<redacted>"),
+            (labeled_secret_re(), "${1}${2}${3}${4}=<redacted>"),
             (email_re(), "<email>"),
             (ssh_target_re(), "<ssh-target>"),
             (ipv6_re(), "${1}<ip>${3}"),
@@ -595,13 +595,30 @@ fn labeled_secret_re() -> &'static Regex {
         // boundary before `token` and a `\btoken\b` rule never fires.
         Regex::new(
             r#"(?ix)
-              # `Bearer <token>` / `Basic <base64>`: separated by a SPACE, so the
-              # `[=:]` form below never fired and the token rode along in the
-              # clear behind a masked `Authorization=`.
-              \b(?:bearer|basic)\s+[A-Za-z0-9._\-+/=]{8,}
-              # A quoted value keeps its spaces. `\S+` stopped at the first one
-              # and published the rest: `password="hunter 2"` leaked `2"`.
-            | (?:^|[^A-Za-z0-9])(\w*(?:authorization|bearer|token|password|passwd|secret|credentials?|cookie|session|api[-_]?key))\s*[=:]\s*(?:"[^"]*"|'[^']*'|(?:bearer|basic)\s+\S+|\S+)
+              # `Bearer <token>` / `Basic <base64>`: separated by a SPACE, so
+              # the `[=:]` form below never fired and the token rode along in
+              # the clear behind a masked `Authorization=`.
+              (^|[^A-Za-z0-9])((?:bearer|basic))\s+[A-Za-z0-9._\-+/=]{8,}
+              # The leading delimiter is CAPTURED, not consumed. Swallowing it
+              # ran words together and, worse, ate newlines — joining a secret's
+              # line to the one before it and hiding where it came from.
+              #
+              # The optional quotes around the separator are what let a secret
+              # inside a JSON payload match: `{"token":"value"}` puts a `"`
+              # between the label and the colon, and `err`/`message` fields
+              # routinely carry JSON from downstream services.
+            | (^|[^A-Za-z0-9])
+              (\w*(?:
+                  authorization|bearer|token|password|passwd|pwd|passphrase
+                | secret|credentials?|cookie|auth
+                | session(?:[-_]?id)?
+                | api[-_]?key|access[-_]?key|private[-_]?key
+              ))
+              # The trailing quote is NOT consumed here: the quoted-value
+              # alternative below has to see it, or `password="hunter 2"`
+              # matches only `hunter` and publishes ` 2"`.
+              "?\s*[=:]\s*
+              (?:"[^"]*"|'[^']*'|(?:bearer|basic)\s+\S+|[^\s"',;]+)
             "#,
         )
         .expect("static labeled-secret pattern")

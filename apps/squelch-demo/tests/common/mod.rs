@@ -52,6 +52,8 @@ pub const CANARIES: &[(&str, &str)] = &[
     ("stripe live key", "sk_live_51H2xxABCDeFghIjKlMnO"),
     ("bearer token", "op4qYzKmVXpN2ABgH8fWmLtestFoo"),
     ("quoted secret tail", "hunter 2 stuff"),
+    ("session cookie value", "s3ss10nvalueXYZ"),
+    ("json-embedded token", "json_embedded_secret_v1"),
 ];
 
 /// Text that must SURVIVE. Over-masking makes the block worthless just as
@@ -78,6 +80,12 @@ pub fn canary_logs() -> String {
         r#"{"timestamp":"2026-08-12T09:00:09Z","level":"error","event":"aws","message":"creds ASIAIOSFODNN7EXAMPLE and sk_live_51H2xxABCDeFghIjKlMnO rejected"}"#,
         r#"{"timestamp":"2026-08-12T09:00:10Z","level":"error","event":"http","message":"Authorization: Bearer op4qYzKmVXpN2ABgH8fWmLtestFoo denied"}"#,
         r#"{"timestamp":"2026-08-12T09:00:11Z","level":"error","event":"cfg","message":"password=\"hunter 2 stuff\" invalid"}"#,
+        // Framework session cookies are named `SESSIONID`/`session_id`, which a
+        // label list ending at `session` never matched.
+        r#"{"timestamp":"2026-08-12T09:00:13Z","level":"error","event":"web","message":"SESSIONID=s3ss10nvalueXYZ rejected"}"#,
+        // `err` and `message` routinely carry JSON from downstream services,
+        // where the separator is `":"` rather than `=`.
+        r#"{"timestamp":"2026-08-12T09:00:14Z","level":"error","event":"api","message":"upstream said {\"token\":\"json_embedded_secret_v1\"}"}"#,
         // A zero-width space inside a credential broke every character class,
         // and renders as nothing, so a human reviewing the preview saw an
         // intact token and no reason to object.
