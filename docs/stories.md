@@ -142,6 +142,15 @@ For the GitHub case there is `form::github::IssueForm`, which mirrors GitHub's
 *documented* issue-form schema rather than any project's template, so it cannot
 drift from a file we do not control.
 
+**Proven, not asserted.** `apps/squelch-demo` exposes the CLI and the agent
+surface over one `Form`, and the end-to-end suite drives the binary rather than
+the library, so the claim that a surface can be built on this API is checked by
+a compiler rather than by this document. Standing the agent surface up
+immediately found a schema no agent could satisfy — `environment` was `required`
+but absent from `properties` under `additionalProperties: false` — which is the
+argument for building a surface rather than describing one. See
+`docs/testing.md`.
+
 ## Non-goals
 
 - **Being a bug tracker.** squelch composes and dispatches. It does not store,
