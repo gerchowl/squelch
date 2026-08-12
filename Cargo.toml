@@ -73,6 +73,21 @@ libc = "0.2"
 
 [dev-dependencies]
 serde_json = "1"
+# A YAML parser, in dev only, so `tests/issue_form.rs` can run this repo's own
+# `.github/ISSUE_TEMPLATE/bug.yml` through `form::github::IssueForm`. The
+# crate's headline claim about the form model is that you can deserialize it
+# from the YAML you already keep in `.github/ISSUE_TEMPLATE/` — and until this
+# test, nothing checked that against real YAML. The only coverage was one
+# hand-written JSON blob, which exercises serde's derive and none of GitHub's
+# actual syntax.
+#
+# `serde_yaml_ng` rather than `serde_yaml`: the latter has been archived
+# unmaintained since 2024, and `deny.toml` would rightly refuse it.
+#
+# A dev-dependency, so no consumer inherits it, and no feature of the published
+# crate can reach it. `cargo hack --feature-powerset --no-dev-deps` (a flake
+# check) is what proves that rather than assumes it.
+serde_yaml_ng = "0.10"
 
 [[example]]
 name = "file_a_bug"

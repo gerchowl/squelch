@@ -8,7 +8,14 @@
 //! # Allowlist, never denylist
 //!
 //! [`Redactor`] keeps an explicitly named set of structured fields and drops
-//! everything else **unread**. A denylist over a logging surface fails open the
+//! everything else **unread** — with two exceptions, `timestamp` and `level`,
+//! which are always extracted because a log line without them is not a log
+//! line. Both are scrubbed like any other value, and were the one hole in this
+//! promise: pulled out of the JSON and rendered verbatim, they published
+//! whatever a hostile emitter put in them while the allowlist protected every
+//! field except the two guaranteed to be present.
+//!
+//! A denylist over a logging surface fails open the
 //! moment someone adds an emitter, and nobody revisits a denylist when they add
 //! a field. With an allowlist, a new field is excluded by default and the worst
 //! case is a report that is less useful than it could be.

@@ -10,12 +10,19 @@
 //! This crate takes **no format dependency**, because every consumer already
 //! has a format and a deserializer, and inheriting ours would be a tax.
 //!
-//! ```ignore
-//! // whichever of these you already depend on
-//! let form: Form = serde_yaml::from_str::<github::IssueForm>(&yaml)?.into();
+//! Enable `serde` and reach for whichever parser you already have — the three
+//! lines below are alternatives, not a sequence:
+//!
+//! ```text
+//! let form: Form = serde_yaml::from_str(&yaml)?;
 //! let form: Form = serde_json::from_str(&json)?;
 //! let form: Form = ron::from_str(&ron)?;
 //! ```
+//!
+//! `text` rather than `ignore`, because none of them can be compiled here:
+//! this crate depends on no deserializer, which is the whole point. An
+//! `ignore`d block looks like a doctest that is temporarily switched off and
+//! reads as verified; this one never can be.
 //!
 //! # Why a form model exists at all
 //!
@@ -337,10 +344,14 @@ impl Form {
 /// project's template, so they cannot drift from a file we do not control.
 /// Bring your own deserializer:
 ///
-/// ```ignore
+/// ```text
 /// let yaml = std::fs::read_to_string(".github/ISSUE_TEMPLATE/bug.yml")?;
 /// let form: Form = serde_yaml::from_str::<github::IssueForm>(&yaml)?.into();
 /// ```
+///
+/// `text` because squelch depends on no YAML parser and so cannot compile
+/// this; `tests/issue_form.rs` runs the equivalent against this repo's own
+/// form, which is the only way the claim gets checked at all.
 ///
 /// [syntax]: https://docs.github.com/en/communities/using-templates-to-encourage-useful-issues-and-pull-requests/syntax-for-issue-forms
 #[cfg(feature = "serde")]

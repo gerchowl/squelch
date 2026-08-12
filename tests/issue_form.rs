@@ -118,6 +118,61 @@ fn the_default_provenance_field_is_declared() {
     );
 }
 
+/// The crate's own GitHub parser, run against a real GitHub issue form.
+///
+/// `form`'s module docs claim you can deserialize a [`squelch::Form`] straight
+/// from "the YAML you already keep in `.github/ISSUE_TEMPLATE/`", and
+/// `form::github` exists to make that true. Until this test the only coverage
+/// was a hand-written JSON blob, which exercises serde's derive and none of
+/// the syntax GitHub actually emits — block scalars, `render:`, `validations:`,
+/// per-option `required` on a checkbox. A consumer following that advice with
+/// an ordinary template would have been the first to find out.
+#[cfg(feature = "serde")]
+#[test]
+fn the_crate_parses_its_own_issue_form() {
+    use squelch::form::github::IssueForm;
+
+    let yaml = read(&repo_root().join(".github/ISSUE_TEMPLATE/bug.yml"));
+    let parsed: IssueForm =
+        serde_yaml_ng::from_str(&yaml).expect("squelch parses a real GitHub issue form");
+    let form: squelch::Form = parsed.into();
+
+    // The line scan and the real parser must agree about which fields can hold
+    // an answer. If they disagree, one of them is wrong about the file, and the
+    // id checks above are resting on whichever it is.
+    //
+    // Answerable only: GitHub lets an element omit `id`, and `form::github`
+    // synthesises `field-<n>` so a surface still has a key. The `markdown`
+    // intro block in this template has no id and gets one, which the line scan
+    // cannot see and should not — it carries no answer.
+    let scanned = declared_ids(&yaml);
+    let answerable: BTreeSet<String> = form
+        .fields
+        .iter()
+        .filter(|f| f.kind.is_answerable())
+        .map(|f| f.id.clone())
+        .collect();
+    assert_eq!(
+        scanned, answerable,
+        "the line scan and `form::github` disagree about which fields this \
+         template offers an answer for"
+    );
+
+    // Round-trip the property the whole file exists for: `required` has to
+    // survive the conversion, or a Form built from a real template would let a
+    // report through with its mandatory sections empty.
+    let required: BTreeSet<&str> = form
+        .fields
+        .iter()
+        .filter(|f| f.required)
+        .map(|f| f.id.as_str())
+        .collect();
+    assert!(
+        required.contains("current-behavior") && required.contains("reproduction"),
+        "`validations: required: true` did not survive the conversion: {required:?}"
+    );
+}
+
 #[test]
 fn the_confirmation_is_a_checkbox_no_url_can_reach() {
     // The crate's stated refusal — a tool that ticks a "yes, I reproduced

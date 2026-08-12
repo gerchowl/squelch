@@ -79,9 +79,13 @@
 //! println!("cargo:rustc-env=MYAPP_PROFILE={}", std::env::var("PROFILE").unwrap());
 //! ```
 //!
-//! ```ignore
+//! ```text
 //! provenance!().build(env!("MYAPP_TARGET"), env!("MYAPP_PROFILE"))
 //! ```
+//!
+//! `text`, not `ignore`: those variables are set by *your* build script, so
+//! this can never compile here. An `ignore`d block reads as a doctest someone
+//! switched off and means to switch back on.
 //!
 //! # Features
 //!
@@ -90,11 +94,15 @@
 //! | `browser` | yes | open the prefilled form; no dependencies |
 //! | `logs` | yes | JSONL extraction (`serde_json`) |
 //! | `gh-cli` | no | create the issue with `gh`; no dependencies |
-//! | `endpoint` | no | POST to an endpoint you operate (`ureq`) |
+//! | `endpoint` | no | POST to an endpoint you operate (`ureq`, `serde_json`) |
+//! | `schema` | no | `Form::json_schema` for an agent tool surface (`serde_json`). Not an intra-doc link: the target does not exist on a default build, and a link that only resolves under one feature breaks `cargo doc` on every other |
 //! | `serde` | no | derive serde on [`Form`], so you can load it from YAML/JSON/TOML/RON with your own parser |
 //!
-//! With `default-features = false` the crate pulls only `regex`, and still
-//! redacts, builds URLs and renders bodies.
+//! With `default-features = false` the crate pulls `regex`, plus `libc` on
+//! Unix — the scrubber falls back to `getpwuid` for the home directory and
+//! username when a service manager has stripped `HOME` and `USER` from the
+//! environment, which is exactly when it would otherwise stop recognising the
+//! paths it exists to mask. It still redacts, builds URLs and renders bodies.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![warn(missing_debug_implementations)]

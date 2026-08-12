@@ -42,7 +42,7 @@ Redaction is the part that's hard to bolt on afterwards, because the failure is 
 
 ## What gets scrubbed
 
-The scrubber is an **allowlist over structured fields** — named fields are kept, everything else is dropped unread — plus value rules over what survives:
+The scrubber is an **allowlist over structured fields** — named fields are kept, everything else is dropped unread, besides `timestamp` and `level`, which are always extracted and scrubbed — plus value rules over what survives:
 
 - the current user's home (`/home/alice/x` → `~/x`) and username, and any other account's home, including Windows profile paths
 - credentials: `ghp_…`, `github_pat_…`, `sk-…`, `xox…`, AWS keys, JWTs
@@ -127,7 +127,7 @@ A missing `Shell:` line leaves a triager unable to tell "this reporter has no `S
 | `schema` | no | `Form::json_schema()` for an agent tool surface (`serde_json`) |
 | `serde` | no | derive serde on `Form`, so you can load it from your own YAML/JSON/TOML |
 
-With `default-features = false` the only dependency is `regex`, and it still redacts, builds URLs and renders bodies.
+With `default-features = false` the dependencies are `regex`, plus `libc` on Unix — the scrubber falls back to `getpwuid` when a service manager has stripped `HOME` and `USER`, which is precisely when it would otherwise stop recognising the paths it's there to mask. It still redacts, builds URLs and renders bodies.
 
 ## Build-time facts
 
