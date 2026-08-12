@@ -1,0 +1,150 @@
+//! A minimal application embedding squelch.
+//!
+//! This is the reporter surface from `docs/stories.md`: the human describes
+//! what broke, and the machine supplies everything else. It exists to be
+//! *driven* — the end-to-end tests run this binary against fake receivers and
+//! assert on what arrived, which is the only place the transport layer is
+//! exercised for real.
+//!
+//! Deliberately not a general-purpose tool. The destination and the form are
+//! the embedder's decision, hardcoded here the way a real application would
+//! hardcode its own.
+
+use std::path::PathBuf;
+use std::process::ExitCode;
+
+use clap::{Parser, Subcommand};
+use squelch::{provenance, Destination, Redactor, Report, Transport, Value};
+
+#[derive(Parser, Debug)]
+#[command(name = "squelch-demo", about = "File a bug report about this app")]
+struct Cli {
+    /// Where the issue goes. A real app would not expose this.
+    #[arg(long, default_value = "gerchowl/squelch", global = true)]
+    repo: String,
+
+    /// What the reporter observed.
+    #[arg(long, global = true, default_value = "every git operation fails")]
+    current: String,
+
+    /// How to reproduce it.
+    #[arg(long, global = true, default_value = "run `demo sync` twice")]
+    repro: String,
+
+    /// A JSONL log file to attach, redacted.
+    #[arg(long, global = true)]
+    log: Option<PathBuf>,
+
+    /// Stand in for a value the application knows and the reporter does not.
+    /// Present so the tests can prove provenance is scrubbed on the way out.
+    #[arg(long, global = true)]
+    workdir: Option<String>,
+
+    #[command(subcommand)]
+    route: Route,
+}
+
+#[derive(Subcommand, Debug)]
+enum Route {
+    /// Render exactly what would leave, and send nothing.
+    Preview,
+    /// Write the report to a file.
+    File { out: PathBuf },
+    /// Build a mailto: URL for the reporter's mail client.
+    Mailto { to: String },
+    /// Open GitHub's prefilled form in a browser.
+    Browser,
+    /// Create the issue with the reporter's own `gh`.
+    Gh {
+        /// Stand in for the human having seen the preview and agreed.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// POST to an endpoint the project operates.
+    Endpoint {
+        url: String,
+        #[arg(long)]
+        confirm: bool,
+        /// Send a per-request credential, exercising `Auth::Bearer`.
+        #[arg(long)]
+        token: Option<String>,
+    },
+}
+
+fn main() -> ExitCode {
+    match run() {
+        Ok(message) => {
+            println!("{message}");
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            // A report path that fails must say why. Writing to stderr and
+            // returning non-zero is what lets the e2e tests assert on refusals
+            // as precisely as on successes.
+            eprintln!("squelch-demo: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<String, Box<dyn std::error::Error>> {
+    let cli = Cli::parse();
+    let redactor = Redactor::new();
+
+    let destination: Destination = cli.repo.parse()?;
+
+    let mut provenance = provenance!()
+        .build("x86_64-unknown-linux-gnu", "release")
+        .commit(option_env!("GIT_COMMIT"));
+    if let Some(workdir) = &cli.workdir {
+        provenance = provenance.with("Workdir", Value::known(workdir));
+    }
+
+    let diagnostics = match &cli.log {
+        Some(path) => {
+            let text = std::fs::read_to_string(path)?;
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+            redactor.records(&text, name.as_deref())
+        }
+        None => Vec::new(),
+    };
+
+    let transport = match &cli.route {
+        Route::Preview => Transport::Browser,
+        Route::File { out } => Transport::File(out.clone()),
+        Route::Mailto { to } => Transport::Mailto(to.clone()),
+        Route::Browser => Transport::Browser,
+        Route::Gh { .. } => Transport::GhCli,
+        Route::Endpoint { url, token, .. } => Transport::Endpoint {
+            url: url.clone(),
+            auth: match token {
+                Some(token) => squelch::Auth::Bearer(token.clone()),
+                None => squelch::Auth::None,
+            },
+        },
+    };
+
+    let mut report = Report::to(destination)
+        .template("bug.yml")
+        .title("demo report")
+        .field("current-behavior", &cli.current)
+        .field("reproduction", &cli.repro)
+        .require(["current-behavior", "reproduction"])
+        .provenance(provenance.scrubbed(&redactor))
+        .diagnostics(diagnostics)
+        .via(transport);
+
+    let confirmed = matches!(
+        cli.route,
+        Route::Gh { confirm: true } | Route::Endpoint { confirm: true, .. }
+    );
+    if confirmed {
+        report = report.confirmed();
+    }
+
+    if matches!(cli.route, Route::Preview) {
+        return Ok(report.preview()?);
+    }
+
+    Ok(format!("{:?}", report.send()?))
+}

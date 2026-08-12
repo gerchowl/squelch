@@ -1,3 +1,10 @@
+# The demo app is a workspace member rather than an example, so the end-to-end
+# tests drive squelch across a crate boundary — through exactly the public API
+# a real consumer has, with a missing `pub` becoming a compile error rather
+# than something no test can see.
+[workspace]
+members = ["apps/squelch-demo"]
+
 [package]
 name = "squelch"
 version = "0.1.0"

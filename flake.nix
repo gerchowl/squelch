@@ -40,10 +40,17 @@
                 overlays = [ devkit.overlays.default ];
               };
               src = ./.;
-              # squelch is mostly feature-gated: `gh-cli`, `endpoint` and
-              # `serde` add 4 tests and a good deal of code a default-features
-              # build never compiles, so clippy would never see it.
-              cargoExtraArgs = "--all-features";
+              # `--all-features`: squelch is mostly feature-gated — `gh-cli`,
+              # `endpoint` and `serde` add tests and a good deal of code a
+              # default-features build never compiles, so clippy would never
+              # see it.
+              #
+              # `--workspace`: this repo is a root package WITH members, and
+              # cargo defaults to the root package alone in that layout. Without
+              # it the whole `apps/squelch-demo` end-to-end suite is skipped and
+              # the check still reports success — nextest said "59 tests across
+              # 1 binary" while thirteen e2e tests sat there unrun.
+              cargoExtraArgs = "--all-features --workspace";
               # For ./rust-toolchain.toml. Changes when the channel or the
               # component list does; the build failure prints the new one.
               toolchainHash = "sha256-mvUGEOHYJpn3ikC5hckneuGixaC+yGrkMM/liDIDgoU=";
