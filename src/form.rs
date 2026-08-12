@@ -268,10 +268,26 @@ impl Form {
             spec.insert("description".into(), description.into());
             properties.insert(field.id.clone(), spec.into());
         }
+        // Required is derived from `prompts()`, NOT from `required_ids()`.
+        // The two answer different questions: `required_ids` is what the
+        // REPORT must carry before it may be built, which includes
+        // machine-filled blocks like `environment` — the application supplies
+        // those. `properties` here lists only what an agent may fill.
+        //
+        // Using `required_ids` made the schema unsatisfiable: `environment`
+        // appeared under `required` but not under `properties`, and with
+        // `additionalProperties: false` an agent could neither omit it nor
+        // supply it. Every conforming object was rejected.
+        let required: Vec<String> = self
+            .prompts()
+            .filter(|field| field.required)
+            .map(|field| field.id.clone())
+            .collect();
+
         serde_json::json!({
             "type": "object",
             "properties": properties,
-            "required": self.required_ids(),
+            "required": required,
             "additionalProperties": false,
         })
     }

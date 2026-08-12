@@ -185,9 +185,18 @@ impl Report {
 
     /// Assemble without sending.
     pub fn build(&self) -> Result<Composed> {
+        // The provenance field counts as answered once provenance is attached.
+        // It is filled below rather than through `field()`, so checking only
+        // `self.fields` made a required machine-filled field permanently
+        // unsatisfiable: `Report::form` adopts it from `Form::required_ids`,
+        // the application supplies it as provenance, and `build` still
+        // reported it missing. A consumer had no way out — the field is not
+        // theirs to type.
+        let provenance_supplied = self.provenance.is_some();
         let missing: Vec<String> = self
             .required
             .iter()
+            .filter(|id| !(provenance_supplied && **id == self.provenance_field))
             .filter(|id| {
                 self.fields
                     .iter()

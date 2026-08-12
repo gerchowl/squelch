@@ -188,7 +188,12 @@ impl Provenance {
     /// Scrub every value. Call before rendering if any entry may carry a path
     /// or hostname — the binary's own location usually does.
     pub fn scrubbed(mut self, redactor: &crate::Redactor) -> Self {
-        for (_, value) in &mut self.entries {
+        // Labels too. Only values were scrubbed, but a label is caller-supplied
+        // and an entirely reasonable one — `Hostname`, `Config path` — carries
+        // exactly the material this masks when the caller builds it from
+        // something dynamic.
+        for (label, value) in &mut self.entries {
+            *label = redactor.scrub(label);
             if let Value::Known(text) = value {
                 *text = redactor.scrub(text);
             }

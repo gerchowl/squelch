@@ -72,6 +72,21 @@ enum Route {
         #[arg(long)]
         confirm: bool,
     },
+    /// Print the JSON schema of the fields an agent may fill.
+    ///
+    /// The agent surface from docs/stories.md. Deliberately describes only
+    /// machine-fillable fields, so an agent is never asked to tick an
+    /// attestation checkbox.
+    Schema,
+    /// Compose from an agent-supplied JSON object and return the payload.
+    ///
+    /// Sends nothing, ever, and takes no route argument — an agent composes
+    /// and hands to a human. That is the property the maintainer story asks
+    /// for: "an agent must be unable to file without a human".
+    Compose {
+        /// A JSON object of `{ "field-id": "answer" }`.
+        json: String,
+    },
     /// POST to an endpoint the project operates.
     Endpoint {
         url: String,
@@ -99,9 +114,81 @@ fn main() -> ExitCode {
     }
 }
 
+/// The form this application reports against.
+///
+/// One definition, read by all three surfaces: the CLI prompts from it, the
+/// agent surface turns it into a schema, and a GUI would render it. `Report`
+/// takes its template, labels and required ids from the same value, so no
+/// surface restates them and drifts.
+fn form() -> squelch::Form {
+    use squelch::{Field, FieldKind};
+    squelch::Form::new([
+        Field::textarea("current-behavior", "Current behavior")
+            .required()
+            .describe("What happens now?"),
+        Field::textarea("reproduction", "Reproduction")
+            .required()
+            .describe("Steps that trigger it."),
+        Field::textarea("environment", "Environment")
+            .required()
+            .machine_filled(),
+        Field::new(
+            "confirm",
+            "Is this reproducible?",
+            FieldKind::Checkboxes {
+                options: vec!["I can reproduce this".into()],
+            },
+        )
+        .required(),
+    ])
+    .template("bug.yml")
+}
+
 fn run() -> Result<String, Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let redactor = Redactor::new();
+
+    // Answered before anything is collected: neither surface reads a log file
+    // or touches the environment.
+    match &cli.route {
+        Route::Schema => {
+            return Ok(serde_json::to_string_pretty(&form().json_schema())?);
+        }
+        Route::Compose { json } => {
+            let answers: serde_json::Value = serde_json::from_str(json)?;
+            let object = answers
+                .as_object()
+                .ok_or("the agent payload must be a JSON object of field answers")?;
+
+            // `additionalProperties: false` is a promise the surface has to
+            // keep. Silently passing an undeclared key through would let an
+            // agent write into a field the schema never offered it — an
+            // attestation checkbox, say — which is the one thing this surface
+            // exists to prevent.
+            let form = form();
+            let offered: Vec<&str> = form.prompts().map(|field| field.id.as_str()).collect();
+            if let Some(unknown) = object.keys().find(|id| !offered.contains(&id.as_str())) {
+                return Err(format!(
+                    "field {unknown:?} is not offered by the schema; allowed: {}",
+                    offered.join(", ")
+                )
+                .into());
+            }
+
+            let mut report = Report::to(cli.repo.parse::<Destination>()?).form(&form);
+            for (id, value) in object {
+                let text = value
+                    .as_str()
+                    .ok_or_else(|| format!("field {id:?} must be a string"))?;
+                report = report.field(id, text);
+            }
+            report = report.provenance(provenance!().scrubbed(&redactor));
+            // preview(), never send(). There is no route argument on this
+            // subcommand precisely so that no flag can turn it into one.
+            return Ok(report.preview()?);
+        }
+        _ => {}
+    }
 
     let destination: Destination = cli.repo.parse()?;
 
@@ -146,6 +233,10 @@ fn run() -> Result<String, Box<dyn std::error::Error>> {
                 None => squelch::Auth::None,
             },
         },
+        // Returned above. Listed rather than caught by a wildcard so that
+        // adding a route cannot silently acquire a transport it never meant
+        // to have — the agent surface in particular must never reach one.
+        Route::Schema | Route::Compose { .. } => unreachable!("handled before collection"),
     };
 
     let mut report = Report::to(destination)

@@ -231,7 +231,25 @@ impl Redactor {
 
     /// Scrub a single string.
     pub fn scrub(&self, value: &str) -> String {
-        let mut out = value.to_string();
+        // Strip invisible characters FIRST. A zero-width space inside a
+        // credential — `ghp_abcdefghijkl\u{200b}mnopqrst` — breaks every
+        // character-class run in the patterns below, so the secret sails
+        // through; and because the preview renders the zero-width as nothing,
+        // a human reviewing it sees an intact token and no reason to object.
+        // Removing them rather than replacing keeps the halves adjacent so the
+        // token matches as itself.
+        let mut out: String = value
+            .chars()
+            .filter(|c| {
+                !matches!(c,
+                    '\u{200b}'..='\u{200f}'
+                    | '\u{202a}'..='\u{202e}'
+                    | '\u{2060}'..='\u{2064}'
+                    | '\u{2066}'..='\u{2069}'
+                    | '\u{feff}'
+                )
+            })
+            .collect();
 
         // Swap public hosts out before the host rule runs, and back after.
         // A negative lookahead is not available in this regex engine, and
@@ -267,11 +285,28 @@ impl Redactor {
 
         // This user's home first (most specific), then anyone else's.
         if let Some(home) = &self.home {
-            out = out.replace(home.as_str(), "~");
+            // Bounded, not a bare substring replace: with HOME `/Users/alice`,
+            // `/Users/aliceOLD/x` became `~OLD/x`, which discloses that a
+            // sibling account exists and half-names it.
+            let bounded = Regex::new(&format!(r"{}(?:/|\b)", regex::escape(home)))
+                .expect("escaped home pattern");
+            out = bounded
+                .replace_all(&out, |caps: &regex::Captures| {
+                    if caps[0].ends_with('/') {
+                        "~/".to_string()
+                    } else {
+                        "~".to_string()
+                    }
+                })
+                .to_string();
         }
         out = home_path_re().replace_all(&out, "<path>").to_string();
         if let Some(user) = &self.user {
-            out = out.replace(user.as_str(), "<user>");
+            // Case-insensitive: logs and macOS paths preserve display case, so
+            // `ATTACKER` and `Attacker` walked straight past a plain replace.
+            let cased =
+                Regex::new(&format!(r"(?i){}", regex::escape(user))).expect("escaped user pattern");
+            out = cased.replace_all(&out, "<user>").to_string();
         }
         out
     }
@@ -298,9 +333,18 @@ impl Redactor {
         let value: serde_json::Value = serde_json::from_str(line).ok()?;
         let object = value.as_object()?;
 
-        let timestamp = first_str(object, &["timestamp", "ts", "time", "@timestamp"])?;
-        let level =
-            first_str(object, &["level", "severity", "lvl"]).unwrap_or_else(|| "INFO".to_string());
+        // Scrubbed like any other value. These two were pulled straight out
+        // of the JSON and rendered verbatim, so a log line could carry a home
+        // path, a token or an address in its `timestamp` and have it published
+        // untouched — the allowlist protected every field except the two that
+        // are always present.
+        let timestamp = self.scrub(&first_str(
+            object,
+            &["timestamp", "ts", "time", "@timestamp"],
+        )?);
+        let level = self.scrub(
+            &first_str(object, &["level", "severity", "lvl"]).unwrap_or_else(|| "INFO".to_string()),
+        );
 
         let mut fields: Vec<(String, String)> = Vec::new();
 
@@ -512,9 +556,17 @@ fn secret_token_re() -> &'static Regex {
             r"(?x)
               gh[pousr]_[A-Za-z0-9]{16,}
             | github_pat_[A-Za-z0-9_]{20,}
+            # Stripe and friends separate with `_`, not `-`; requiring the dash
+            # let every `sk_live_…` through.
+            | [sr]k_(?:live|test)_[A-Za-z0-9]{16,}
             | sk-[A-Za-z0-9_\-]{20,}
             | xox[baprs]-[A-Za-z0-9\-]{10,}
-            | AKIA[0-9A-Z]{16}
+            # The whole AWS key-id family, not just long-lived user keys. ASIA
+            # (STS session) is the one a compromised CI actually leaks.
+            | (?:AKIA|ASIA|AIDA|AROA|AGPA|AIPA|ANPA|ANVA|APKA)[0-9A-Z]{16}
+            # Private key material: mask the armour, since the base64 body that
+            # follows is on its own lines and matches nothing else here.
+            | -----BEGIN[A-Z ]*PRIVATE\ KEY-----
             | eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}
             ",
         )
@@ -530,7 +582,15 @@ fn labeled_secret_re() -> &'static Regex {
         // `\b` does not help there — `_` is a word character, so there is no
         // boundary before `token` and a `\btoken\b` rule never fires.
         Regex::new(
-            r"(?i)(?:^|[^A-Za-z0-9])(\w*(?:authorization|bearer|token|password|passwd|secret|credentials?|cookie|session|api[-_]?key))\s*[=:]\s*\S+",
+            r#"(?ix)
+              # `Bearer <token>` / `Basic <base64>`: separated by a SPACE, so the
+              # `[=:]` form below never fired and the token rode along in the
+              # clear behind a masked `Authorization=`.
+              \b(?:bearer|basic)\s+[A-Za-z0-9._\-+/=]{8,}
+              # A quoted value keeps its spaces. `\S+` stopped at the first one
+              # and published the rest: `password="hunter 2"` leaked `2"`.
+            | (?:^|[^A-Za-z0-9])(\w*(?:authorization|bearer|token|password|passwd|secret|credentials?|cookie|session|api[-_]?key))\s*[=:]\s*(?:"[^"]*"|'[^']*'|(?:bearer|basic)\s+\S+|\S+)
+            "#,
         )
         .expect("static labeled-secret pattern")
     })
@@ -554,7 +614,16 @@ fn ssh_target_re() -> &'static Regex {
 fn ipv6_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r"\[?(?:[0-9A-Fa-f]{1,4}:){2,7}[0-9A-Fa-f]{0,4}(?:%[A-Za-z0-9]+)?\]?")
+        // The old pattern needed two full `hex:` groups, so every compressed
+        // form — `::1`, `fe80::1`, `2001::abcd` — passed through untouched.
+        // Those are the addresses that actually appear in logs.
+        Regex::new(
+            r"(?x)
+              \[?(?:[0-9A-Fa-f]{1,4}:){2,7}[0-9A-Fa-f]{1,4}(?:%[A-Za-z0-9]+)?\]?
+            | \[?(?:[0-9A-Fa-f]{1,4}:)*[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:)*[0-9A-Fa-f]{0,4}(?:%[A-Za-z0-9]+)?\]?
+            | \[?::(?:[0-9A-Fa-f]{1,4}:)*[0-9A-Fa-f]{1,4}(?:%[A-Za-z0-9]+)?\]?
+            ",
+        )
             .expect("static ipv6 pattern")
     })
 }
@@ -583,8 +652,8 @@ fn private_host_re() -> &'static Regex {
     RE.get_or_init(|| {
         Regex::new(
             r"(?xi)
-              \b[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*\.(?:corp|internal|intranet|local|lan|home|priv|private|arpa)\b
-            | \b[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+){2,}\.[A-Za-z]{2,}\b
+              [A-Za-z0-9_\-]+(?:\.[A-Za-z0-9_\-]+)*\.(?:corp|internal|intranet|local|lan|home|priv|private|arpa)\b
+            | [A-Za-z0-9_\-]+(?:\.[A-Za-z0-9_\-]+){1,}\.[A-Za-z]{2,}\b
             ",
         )
         .expect("static private-host pattern")
@@ -598,8 +667,18 @@ fn home_path_re() -> &'static Regex {
     RE.get_or_init(|| {
         Regex::new(
             r"(?xi)
-              (?:/Users|/home)/[A-Za-z0-9._\-]+(?:/[^\s\x22]*)?
+              (?:/Users|/home)/[^\s\x22/]+(?:/[^\s\x22]*)?
+            # Root's home is still an account's home, and a path under it says
+            # the process ran privileged.
+            | /var/root(?:/[^\s\x22]*)?
+            | /root(?:/[^\s\x22]*)?
+            # macOS per-user temp: the salt uniquely identifies the user.
+            | /private/var/folders/[^\s\x22]*
+            | /var/folders/[^\s\x22]*
+            # `~alice/.bashrc` names the account without any /home prefix.
+            | ~[A-Za-z0-9._\-]+(?:/[^\s\x22]*)?
             | [A-Z]:\\Users\\[^\\/\s\x22]+(?:\\[^\s\x22]*)?
+            | [A-Z]:\\Documents\ and\ Settings\\[^\\/\s\x22]+(?:\\[^\s\x22]*)?
             ",
         )
         .expect("static home-path pattern")

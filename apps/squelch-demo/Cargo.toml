@@ -11,5 +11,8 @@ publish = false
 # Every route is enabled: this app exists to be driven across all of them by
 # the end-to-end tests, including the two that transmit without a built-in
 # review surface. A real consumer would enable only what it ships.
-squelch = { path = "../..", features = ["gh-cli", "endpoint"] }
+squelch = { path = "../..", features = ["gh-cli", "endpoint", "schema"] }
 clap = { version = "4", features = ["derive"] }
+# The agent surface hands over a JSON object of answers; parsing it is the
+# embedder's job, since squelch takes no format dependency of its own.
+serde_json = "1"

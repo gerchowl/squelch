@@ -41,6 +41,17 @@ pub const CANARIES: &[(&str, &str)] = &[
     ("internal hostname", "build01.internal.acme.corp"),
     ("private org and repo", "acme-private"),
     ("labelled secret value", "s3cr3t-value-here"),
+    // Added after an adversarial review pass; each one leaked when written.
+    ("compressed ipv6", "fe80::1"),
+    ("compressed ipv6 with tail", "2001::abcd"),
+    ("underscored hostname label", "foo_bar.example.com"),
+    ("root home path", "/root/.ssh"),
+    ("macos per-user temp", "/private/var/folders/x1"),
+    ("tilde-user path", "~alice/.bashrc"),
+    ("aws session key id", "ASIAIOSFODNN7EXAMPLE"),
+    ("stripe live key", "sk_live_51H2xxABCDeFghIjKlMnO"),
+    ("bearer token", "op4qYzKmVXpN2ABgH8fWmLtestFoo"),
+    ("quoted secret tail", "hunter 2 stuff"),
 ];
 
 /// Text that must SURVIVE. Over-masking makes the block worthless just as
@@ -58,6 +69,19 @@ pub fn canary_logs() -> String {
         r#"{"timestamp":"2026-08-12T09:00:02Z","level":"warn","event":"auth.refresh","message":"refresh_token=s3cr3t-value-here rejected for alice@example.com"}"#,
         r#"{"timestamp":"2026-08-12T09:00:03Z","level":"error","event":"net.dial","message":"dial build01.internal.acme.corp (10.1.2.3) failed","remote":"git@github.com:acme-private/secret-thing.git"}"#,
         r#"{"timestamp":"2026-08-12T09:00:04Z","level":"error","event":"token.use","message":"using ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"}"#,
+        // A timestamp is not a safe field: it was rendered verbatim, so
+        // anything a logging stack interpolated into it was published.
+        r#"{"timestamp":"2026-08-12T09:00:05Z host=build01.internal.acme.corp","level":"error","event":"e","message":"m"}"#,
+        r#"{"timestamp":"2026-08-12T09:00:06Z","level":"error","event":"net","message":"peer fe80::1 and 2001::abcd unreachable"}"#,
+        r#"{"timestamp":"2026-08-12T09:00:07Z","level":"error","event":"dns","message":"resolve foo_bar.example.com failed"}"#,
+        r#"{"timestamp":"2026-08-12T09:00:08Z","level":"error","event":"fs","message":"open /root/.ssh/id_rsa and /private/var/folders/x1/abc/T/f and ~alice/.bashrc"}"#,
+        r#"{"timestamp":"2026-08-12T09:00:09Z","level":"error","event":"aws","message":"creds ASIAIOSFODNN7EXAMPLE and sk_live_51H2xxABCDeFghIjKlMnO rejected"}"#,
+        r#"{"timestamp":"2026-08-12T09:00:10Z","level":"error","event":"http","message":"Authorization: Bearer op4qYzKmVXpN2ABgH8fWmLtestFoo denied"}"#,
+        r#"{"timestamp":"2026-08-12T09:00:11Z","level":"error","event":"cfg","message":"password=\"hunter 2 stuff\" invalid"}"#,
+        // A zero-width space inside a credential broke every character class,
+        // and renders as nothing, so a human reviewing the preview saw an
+        // intact token and no reason to object.
+        &format!(r#"{{"timestamp":"2026-08-12T09:00:12Z","level":"error","event":"zw","message":"using ghp_ZeroWidth{}SplitTokenAbcdefghij now"}}"#, "\u{200b}"),
     ]
     .join("\n")
 }
