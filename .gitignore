@@ -1,2 +1,5 @@
 /target
-Cargo.lock
+
+# nix build outputs
+/result
+/result-*
