@@ -90,6 +90,15 @@ pub fn build(destination: &Destination, template: &str, fields: &[(&str, String)
                 continue;
             }
             encoded = truncate_encoded(&encoded, room);
+            // With room for only one or two characters and a value beginning
+            // with a `%XX` escape, `truncate_encoded` walks the cut to zero and
+            // the field would ship as nothing but the note. That is a dropped
+            // field wearing a stub, so it is reported as one — a reporter told
+            // "shortened" would expect to find something there.
+            if encoded.is_empty() {
+                dropped.push((*id).to_string());
+                continue;
+            }
             encoded.push_str(&encode(NOTE));
             shortened.push((*id).to_string());
         }
@@ -222,16 +231,52 @@ mod tests {
         ];
         let built = build(&destination(), "bug.yml", &fields);
         assert!(built.url.len() <= MAX_URL_LEN, "{} chars", built.url.len());
-        assert!(built.is_lossy());
-        // Whichever fields lost text must be named, and a field can only be in
-        // one bucket: the body still carries every one of them, so a caller
-        // reconciling body against URL needs the accounting to be exact.
-        for id in built.shortened.iter().chain(built.dropped.iter()) {
-            assert!(["a", "b", "c"].contains(&id.as_str()), "unexpected id {id}");
-        }
-        for id in &built.shortened {
-            assert!(!built.dropped.contains(id), "{id} is in both buckets");
-        }
+        // The exact accounting, not merely "each id is somewhere": the first
+        // field fills the budget and the two after it are squeezed out. A
+        // weaker assertion would pass a bucket-swap regression.
+        assert_eq!(built.shortened, vec!["a".to_string()]);
+        assert_eq!(built.dropped, vec!["b".to_string(), "c".to_string()]);
+    }
+
+    #[test]
+    fn a_value_that_exactly_fills_the_budget_is_kept_whole() {
+        // The comparison is `>` rather than `>=`, so a value that fits exactly
+        // must survive untouched — an off-by-one here would shorten a report
+        // that never needed it.
+        let base_len = format!(
+            "https://github.com/{}/issues/new?template={}",
+            destination().slug(),
+            "bug.yml"
+        )
+        .len();
+        let room = MAX_URL_LEN - base_len - "&impact=".len();
+        let built = build(&destination(), "bug.yml", &[("impact", "x".repeat(room))]);
+        assert!(
+            !built.is_lossy(),
+            "{:?} / {:?}",
+            built.shortened,
+            built.dropped
+        );
+        assert_eq!(built.url.len(), MAX_URL_LEN);
+    }
+
+    #[test]
+    fn a_field_whose_name_alone_will_not_fit_is_dropped_not_shortened() {
+        // When the `&id=` prefix alone exceeds what is left, there is no room
+        // for even a stub. `saturating_sub` resolves the arithmetic to zero;
+        // this pins that it routes to `dropped`.
+        let built = build(
+            &destination(),
+            "bug.yml",
+            &[
+                ("first", "x".repeat(40_000)),
+                ("a-second-field-with-a-long-name", "y".to_string()),
+            ],
+        );
+        assert_eq!(
+            built.dropped,
+            vec!["a-second-field-with-a-long-name".to_string()]
+        );
     }
 
     #[test]
