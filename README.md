@@ -51,8 +51,15 @@ The scrubber is an **allowlist over structured fields** — named fields are kep
 - IPv4, and IPv6 **including compressed forms** — `::1`, `fe80::1`, `2001::abcd`
   are what logs actually contain, and a rule needing two full `hex:` groups
   misses all of them
-- hostnames under private suffixes, and any FQDN of three or more labels,
-  with `_` allowed in a label because SRV records and internal DNS use it
+- hostnames under private suffixes (`.internal`, `.corp`, `.local`, …) at any
+  depth, and lowercase FQDNs of four or more labels, with `_` allowed in a label
+  because SRV records and internal DNS use it
+
+  Four labels, not three, and lowercase-only, because the alternative destroys
+  the block: three labels ate `config.yml.bak` and `os.path.join`, and
+  case-insensitivity ate `java.lang.Thread.run`. A three-label public host like
+  `foo.example.com` therefore survives — deliberately. Anything genuinely
+  internal is caught by its suffix regardless of depth.
 
 Invisible characters are stripped **before** any rule runs. A zero-width space
 inside a credential breaks every character-class run, and renders as nothing —

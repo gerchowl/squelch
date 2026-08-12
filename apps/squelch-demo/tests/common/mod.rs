@@ -44,7 +44,7 @@ pub const CANARIES: &[(&str, &str)] = &[
     // Added after an adversarial review pass; each one leaked when written.
     ("compressed ipv6", "fe80::1"),
     ("compressed ipv6 with tail", "2001::abcd"),
-    ("underscored hostname label", "foo_bar.example.com"),
+    ("underscored hostname label", "build01.foo_bar.example.com"),
     ("root home path", "/root/.ssh"),
     ("macos per-user temp", "/private/var/folders/x1"),
     ("tilde-user path", "~alice/.bashrc"),
@@ -73,7 +73,7 @@ pub fn canary_logs() -> String {
         // anything a logging stack interpolated into it was published.
         r#"{"timestamp":"2026-08-12T09:00:05Z host=build01.internal.acme.corp","level":"error","event":"e","message":"m"}"#,
         r#"{"timestamp":"2026-08-12T09:00:06Z","level":"error","event":"net","message":"peer fe80::1 and 2001::abcd unreachable"}"#,
-        r#"{"timestamp":"2026-08-12T09:00:07Z","level":"error","event":"dns","message":"resolve foo_bar.example.com failed"}"#,
+        r#"{"timestamp":"2026-08-12T09:00:07Z","level":"error","event":"dns","message":"resolve build01.foo_bar.example.com failed"}"#,
         r#"{"timestamp":"2026-08-12T09:00:08Z","level":"error","event":"fs","message":"open /root/.ssh/id_rsa and /private/var/folders/x1/abc/T/f and ~alice/.bashrc"}"#,
         r#"{"timestamp":"2026-08-12T09:00:09Z","level":"error","event":"aws","message":"creds ASIAIOSFODNN7EXAMPLE and sk_live_51H2xxABCDeFghIjKlMnO rejected"}"#,
         r#"{"timestamp":"2026-08-12T09:00:10Z","level":"error","event":"http","message":"Authorization: Bearer op4qYzKmVXpN2ABgH8fWmLtestFoo denied"}"#,

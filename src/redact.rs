@@ -231,25 +231,37 @@ impl Redactor {
 
     /// Scrub a single string.
     pub fn scrub(&self, value: &str) -> String {
-        // Strip invisible characters FIRST. A zero-width space inside a
-        // credential — `ghp_abcdefghijkl\u{200b}mnopqrst` — breaks every
-        // character-class run in the patterns below, so the secret sails
-        // through; and because the preview renders the zero-width as nothing,
-        // a human reviewing it sees an intact token and no reason to object.
-        // Removing them rather than replacing keeps the halves adjacent so the
-        // token matches as itself.
-        let mut out: String = value
-            .chars()
-            .filter(|c| {
-                !matches!(c,
-                    '\u{200b}'..='\u{200f}'
-                    | '\u{202a}'..='\u{202e}'
-                    | '\u{2060}'..='\u{2064}'
-                    | '\u{2066}'..='\u{2069}'
-                    | '\u{feff}'
-                )
-            })
-            .collect();
+        // Strip invisibles only where one could hide a split credential:
+        // between two ASCII alphanumerics. A zero-width space inside
+        // `ghp_abc<zwsp>def` defeats every character-class run below and
+        // renders as nothing, so a reviewer sees an intact token. Stripping
+        // unconditionally was worse than the problem — U+200D between emoji is
+        // a grapheme joiner, and removing it turned one glyph into three.
+        let chars: Vec<char> = value.chars().collect();
+        let invisible = |c: char| {
+            matches!(c,
+                '\u{200b}'..='\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{feff}'
+            )
+        };
+        let mut stripped = String::with_capacity(value.len());
+        for (index, ch) in chars.iter().enumerate() {
+            let hides_a_secret = invisible(*ch)
+                && index
+                    .checked_sub(1)
+                    .and_then(|i| chars.get(i))
+                    .is_some_and(|c| c.is_ascii_alphanumeric())
+                && chars
+                    .get(index + 1)
+                    .is_some_and(|c| c.is_ascii_alphanumeric());
+            if !hides_a_secret {
+                stripped.push(*ch);
+            }
+        }
+        let mut out = stripped;
 
         // Swap public hosts out before the host rule runs, and back after.
         // A negative lookahead is not available in this regex engine, and
@@ -272,7 +284,7 @@ impl Redactor {
             (labeled_secret_re(), "$1=<redacted>"),
             (email_re(), "<email>"),
             (ssh_target_re(), "<ssh-target>"),
-            (ipv6_re(), "<ip>"),
+            (ipv6_re(), "${1}<ip>${3}"),
             (ipv4_re(), "<ip>"),
             (private_host_re(), "<host>"),
         ] {
@@ -614,17 +626,23 @@ fn ssh_target_re() -> &'static Regex {
 fn ipv6_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        // The old pattern needed two full `hex:` groups, so every compressed
-        // form — `::1`, `fe80::1`, `2001::abcd` — passed through untouched.
-        // Those are the addresses that actually appear in logs.
+        // Delimited on both sides. Without that, the compressed alternative
+        // matched `d::c` inside `std::collections::HashMap`, so every Rust log
+        // line and backtrace came out corrupted mid-word. The engine has no
+        // lookaround, so the delimiters are captured and restored.
         Regex::new(
             r"(?x)
-              \[?(?:[0-9A-Fa-f]{1,4}:){2,7}[0-9A-Fa-f]{1,4}(?:%[A-Za-z0-9]+)?\]?
-            | \[?(?:[0-9A-Fa-f]{1,4}:)*[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:)*[0-9A-Fa-f]{0,4}(?:%[A-Za-z0-9]+)?\]?
-            | \[?::(?:[0-9A-Fa-f]{1,4}:)*[0-9A-Fa-f]{1,4}(?:%[A-Za-z0-9]+)?\]?
+              (^|[^0-9A-Za-z_:.])
+              (
+                (?:[0-9A-Fa-f]{1,4}:){2,7}[0-9A-Fa-f]{1,4}
+              | (?:[0-9A-Fa-f]{1,4}:)+:(?:[0-9A-Fa-f]{1,4}:?)*[0-9A-Fa-f]{0,4}
+              | ::(?:[0-9A-Fa-f]{1,4}:)*[0-9A-Fa-f]{1,4}
+              )
+              (?:%[A-Za-z0-9]+)?
+              ($|[^0-9A-Za-z_:.])
             ",
         )
-            .expect("static ipv6 pattern")
+        .expect("static ipv6 pattern")
     })
 }
 
@@ -653,7 +671,12 @@ fn private_host_re() -> &'static Regex {
         Regex::new(
             r"(?xi)
               [A-Za-z0-9_\-]+(?:\.[A-Za-z0-9_\-]+)*\.(?:corp|internal|intranet|local|lan|home|priv|private|arpa)\b
-            | [A-Za-z0-9_\-]+(?:\.[A-Za-z0-9_\-]+){1,}\.[A-Za-z]{2,}\b
+            # Four labels, and case-sensitive: hostnames are conventionally
+            # lowercase, while a capitalised label means a class name. Three
+            # labels ate `config.yml.bak` and `os.path.join`; case-insensitivity
+            # ate `java.lang.Thread.run`. A capitalised host under a private
+            # suffix is still caught by the rule above.
+            | (?-i:[a-z0-9_\-]+(?:\.[a-z0-9_\-]+){2,}\.[a-z]{2,})\b
             ",
         )
         .expect("static private-host pattern")
@@ -670,8 +693,8 @@ fn home_path_re() -> &'static Regex {
               (?:/Users|/home)/[^\s\x22/]+(?:/[^\s\x22]*)?
             # Root's home is still an account's home, and a path under it says
             # the process ran privileged.
-            | /var/root(?:/[^\s\x22]*)?
-            | /root(?:/[^\s\x22]*)?
+            | /var/root\b(?:/[^\s\x22]*)?
+            | /root\b(?:/[^\s\x22]*)?
             # macOS per-user temp: the salt uniquely identifies the user.
             | /private/var/folders/[^\s\x22]*
             | /var/folders/[^\s\x22]*
@@ -862,6 +885,62 @@ mod tests {
                 assert!(!out.contains(forbidden), "leaked {forbidden:?} in {out}");
             }
             assert!(out.contains("event=remote.install"), "{out}");
+        }
+    }
+
+    #[test]
+    fn code_shaped_text_is_not_mistaken_for_a_host_or_an_address() {
+        // Every string here was destroyed by a redaction fix at some point.
+        // Over-masking is not the safe direction: a block scrubbed into
+        // uselessness costs the same triage round trip as no block at all.
+        let redactor = redactor();
+        for intact in [
+            // `d::c` inside this matched the compressed-IPv6 rule.
+            "std::collections::HashMap",
+            "std::io::Error",
+            "app::db::conn",
+            // Dotted identifiers are not FQDNs.
+            "com.example.Main",
+            "at java.lang.Thread.run",
+            "org.apache.commons.Lang",
+            "os.path.join",
+            "django.db.models",
+            // Filenames with two extensions are not FQDNs either.
+            "config.yml.bak",
+            "foo.tar.gz",
+            "lib.rs.orig",
+            // A prefix is not a path.
+            "/roots",
+            "/rootbeer",
+            "/var/rooted",
+        ] {
+            assert_eq!(
+                redactor.scrub(intact),
+                intact,
+                "{intact:?} must survive the scrubber intact"
+            );
+        }
+    }
+
+    #[test]
+    fn an_emoji_joiner_is_not_treated_as_a_hidden_credential() {
+        // Invisibles are stripped so a zero-width space cannot split a token,
+        // but U+200D between emoji is a grapheme joiner: removing it turns one
+        // glyph into three.
+        let redactor = redactor();
+        let family = "\u{1f469}\u{200d}\u{1f52c} ran the job";
+        assert_eq!(redactor.scrub(family), family);
+    }
+
+    #[test]
+    fn compressed_ipv6_is_still_masked_after_the_boundary_fix() {
+        let redactor = redactor();
+        for (input, expected) in [
+            ("peer fe80::1 down", "peer <ip> down"),
+            ("peer 2001::abcd down", "peer <ip> down"),
+            ("listening on ::1", "listening on <ip>"),
+        ] {
+            assert_eq!(redactor.scrub(input), expected, "{input:?}");
         }
     }
 }
