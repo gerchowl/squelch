@@ -254,8 +254,8 @@ impl Transport {
     ///
     /// `gh` first — filing without leaving the terminal beats a browser round
     /// trip — then a browser, then a file the reporter can attach. Never
-    /// selects [`Transport::Endpoint`], which needs a URL only the embedder
-    /// has.
+    /// selects the `Endpoint` route (`endpoint` feature), which needs a URL
+    /// only the embedder has.
     ///
     /// This probes the environment, so call it once and reuse the result.
     /// Note that a route it picks may still require [`crate::Report::confirmed`]

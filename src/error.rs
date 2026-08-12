@@ -26,7 +26,10 @@ pub enum Error {
         status: Option<u16>,
         message: String,
     },
-    /// Raised by an [`crate::Auth::Dynamic`] callback.
+    /// Raised by an `Auth::Dynamic` callback (`endpoint` feature). Not an
+    /// intra-doc link: the target does not exist on a default build, and a
+    /// link that only resolves under one feature breaks `cargo doc` on every
+    /// other.
     Auth(String),
 }
 
