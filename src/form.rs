@@ -218,13 +218,33 @@ impl Form {
     pub fn parse_skeleton(text: &str) -> Vec<(String, String)> {
         let mut out: Vec<(String, String)> = Vec::new();
         let mut current: Option<String> = None;
-        let mut in_fence = false;
+        // Which marker opened the current fence, so a ``` block is closed by
+        // ``` and not by a stray ~~~ inside it. One flag for both let a
+        // legitimate `~~~` in a shell transcript close the block early, after
+        // which the next `##` split the content across sections it never
+        // belonged to.
+        let mut fence: Option<&str> = None;
 
         for line in text.lines() {
             let trimmed = line.trim();
-            if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-                in_fence = !in_fence;
-            } else if !in_fence {
+            // Four-space indentation is a code block in CommonMark, so a `##`
+            // there is content. Treating it as a heading invented a section and
+            // silently emptied the real one.
+            let indented = line.starts_with("    ") || line.starts_with('\t');
+            let marker = if trimmed.starts_with("```") {
+                Some("```")
+            } else if trimmed.starts_with("~~~") {
+                Some("~~~")
+            } else {
+                None
+            };
+            if let Some(marker) = marker {
+                match fence {
+                    Some(open) if open == marker => fence = None,
+                    Some(_) => {}
+                    None => fence = Some(marker),
+                }
+            } else if fence.is_none() && !indented {
                 if let Some(heading) = trimmed.strip_prefix("## ") {
                     current = Some(heading.trim().to_string());
                     continue;
@@ -621,5 +641,35 @@ mod tests {
 
         // Markdown blocks carry no answer.
         assert!(form.fields.iter().any(|f| f.kind == FieldKind::Markdown));
+    }
+
+    #[test]
+    fn a_tilde_fence_does_not_close_a_backtick_fence() {
+        // A shell transcript containing `~~~` closed the ``` block early, and
+        // the next `##` then split the reporter's content across sections it
+        // never belonged to.
+        let parsed = Form::parse_skeleton(
+            "## reproduction\nRun:\n```sh\n~~~\n## not a heading\n```\nThen it dies.\n",
+        );
+        let repro = &parsed
+            .iter()
+            .find(|(id, _)| id == "reproduction")
+            .expect("reproduction survived")
+            .1;
+        assert!(repro.contains("## not a heading"), "{repro}");
+        assert!(repro.contains("Then it dies."), "{repro}");
+        assert!(!parsed.iter().any(|(id, _)| id == "not a heading"));
+    }
+
+    #[test]
+    fn an_indented_heading_is_code_not_structure() {
+        // Four spaces is a code block in CommonMark. Treating the `##` there as
+        // a heading invented a section and silently emptied the real one.
+        let parsed = Form::parse_skeleton("## reproduction\n    ## indented\nreal content\n");
+        assert!(
+            parsed.iter().any(|(id, _)| id == "reproduction"),
+            "the real section was emptied: {parsed:?}"
+        );
+        assert!(!parsed.iter().any(|(id, _)| id == "indented"), "{parsed:?}");
     }
 }

@@ -217,7 +217,19 @@ impl Report {
             .collect();
 
         if let Some(provenance) = &self.provenance {
-            values.push((self.provenance_field.as_str(), provenance.to_markdown()));
+            // Replace rather than append when the id is already present.
+            // Pushing unconditionally emitted the parameter twice and rendered
+            // two `### <label>` sections — and since a GitHub prefill takes the
+            // last value, the reporter's own words were overwritten by the
+            // environment block the moment the form opened. `environment` is a
+            // common field id, so a form declaring one collided by default.
+            match values
+                .iter_mut()
+                .find(|(id, _)| *id == self.provenance_field)
+            {
+                Some((_, slot)) => *slot = provenance.to_markdown(),
+                None => values.push((self.provenance_field.as_str(), provenance.to_markdown())),
+            }
         }
 
         let url = url::build(&self.destination, &self.template, &values);
@@ -586,5 +598,40 @@ mod tests {
             .unwrap();
         assert!(composed.body.contains("actually it hangs"));
         assert!(!composed.body.contains("it crashes"));
+    }
+
+    #[test]
+    fn the_provenance_field_does_not_duplicate_a_form_field() {
+        use crate::form::{Field, Form};
+
+        // `environment` is a common field id, and it is also the default
+        // provenance field, so a form declaring one collided by default. The
+        // parameter was emitted twice; since a GitHub prefill takes the last
+        // value, the reporter's own words were overwritten the moment the form
+        // opened.
+        let form = Form::new([
+            Field::textarea("current-behavior", "Current behavior"),
+            Field::textarea("environment", "Environment"),
+        ]);
+        let composed = Report::to(Destination::parse("gerchowl/squelch").unwrap())
+            .form(&form)
+            .field("current-behavior", "it crashes")
+            .field("environment", "typed by the reporter")
+            .provenance(Provenance::new().with("Shell", Value::known("zsh")))
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            composed.url.url.matches("&environment=").count(),
+            1,
+            "environment was sent twice: {}",
+            composed.url.url
+        );
+        assert_eq!(
+            composed.body.matches("### Environment").count(),
+            1,
+            "the body carries two Environment sections: {}",
+            composed.body
+        );
     }
 }
