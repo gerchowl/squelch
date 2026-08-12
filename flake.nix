@@ -2,11 +2,10 @@
   description = "squelch — file a genuinely useful bug report without leaking the machine";
 
   inputs = {
-    # The Rust language pack under review: vig-os/devkit#1429, plus the
-    # consumer fixes this repo's adoption produced (vig-os/devkit#1452, which
-    # targets the pack branch). Repoint at the pack branch once #1452 merges,
-    # and at a release tag once the pack does.
-    devkit.url = "github:vig-os/devkit/feature/1450-rust-pack-consumer-hardening";
+    # The Rust language pack under review: vig-os/devkit#1429, now carrying the
+    # consumer fixes this repo's adoption produced (#1452, merged). Repoint at
+    # a release tag once the pack itself lands on devkit's dev branch.
+    devkit.url = "github:vig-os/devkit/feature/1400-rust-language-pack";
     nixpkgs.follows = "devkit/nixpkgs";
   };
 

@@ -29,16 +29,16 @@
         "treefmt-nix": "treefmt-nix"
       },
       "locked": {
-        "lastModified": 1786527846,
+        "lastModified": 1786539887,
         "narHash": "sha256-4CGYTVwzF0DRv7m3h31ASiAHNPZHm9YxtWcdRSdyQbc=",
         "owner": "vig-os",
         "repo": "devkit",
-        "rev": "4be5e00dff4204e2123c63b0c7cbc3c34e528c9b",
+        "rev": "9072c9165c2d8386b3f2c21400b23d4436bd0d92",
         "type": "github"
       },
       "original": {
         "owner": "vig-os",
-        "ref": "feature/1450-rust-pack-consumer-hardening",
+        "ref": "feature/1400-rust-language-pack",
         "repo": "devkit",
         "type": "github"
       }
