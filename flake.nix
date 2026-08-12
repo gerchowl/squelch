@@ -53,6 +53,16 @@
               # the check still reports success — nextest said "59 tests across
               # 1 binary" while thirteen e2e tests sat there unrun.
               cargoExtraArgs = "--all-features --workspace";
+              # crane's source filter walks the crate directories for cargo
+              # sources, so neither of these reaches the sandbox on its own —
+              # and `tests/issue_form.rs` asserts they agree with each other.
+              # Without them the test does not fail, it panics on a missing
+              # file, which reads as a broken test rather than the drift it is
+              # actually there to catch.
+              extraSrcFiles = [
+                ".github/ISSUE_TEMPLATE/bug.yml"
+                "README.md"
+              ];
               # For ./rust-toolchain.toml. Changes when the channel or the
               # component list does; the build failure prints the new one.
               toolchainHash = "sha256-mvUGEOHYJpn3ikC5hckneuGixaC+yGrkMM/liDIDgoU=";

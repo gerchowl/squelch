@@ -16,7 +16,13 @@ repository = "https://github.com/gerchowl/squelch"
 keywords = ["bug-report", "issue", "redaction", "github", "diagnostics"]
 categories = ["command-line-interface", "development-tools::debugging"]
 readme = "README.md"
-exclude = ["/.github", "/target"]
+# `/.github` is repository furniture, not crate content — but `tests/issue_form.rs`
+# reads it, so that test has to leave with it. It asserts a property of the
+# *repository* (the ids this repo's own examples prefill are declared by the
+# issue form this repo ships), which is meaningless once unpacked from a
+# .crate. Publishing it would hand every downstream a test that panics on a
+# missing file.
+exclude = ["/.github", "/target", "/tests/issue_form.rs"]
 
 [features]
 default = ["browser", "logs"]
