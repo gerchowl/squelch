@@ -1,3 +1,10 @@
+# The demo app is a workspace member rather than an example, so the end-to-end
+# tests drive squelch across a crate boundary — through exactly the public API
+# a real consumer has, with a missing `pub` becoming a compile error rather
+# than something no test can see.
+[workspace]
+members = ["apps/squelch-demo"]
+
 [package]
 name = "squelch"
 version = "0.1.0"
@@ -20,9 +27,21 @@ browser = []
 logs = ["dep:serde_json"]
 # Submit through a project-hosted HTTP endpoint. Pulls in a blocking HTTP
 # client — read the abuse warning on `Transport::Endpoint` before enabling.
-endpoint = ["dep:ureq"]
+#
+# `serde_json` is a real dependency of this feature, not a convenience: the
+# route serialises its payload with `json!`. It was missing here and the crate
+# simply did not compile with `endpoint` unless `logs` happened to be on too.
+# Nothing in CI saw it — `--all-features` enables `logs`, and the dev-dependency
+# on serde_json masks it for anything built with tests. Only a consumer using
+# `default-features = false` hit it.
+endpoint = ["dep:ureq", "dep:serde_json"]
 # Submit with the `gh` CLI when it is installed and authenticated.
 gh-cli = []
+# `Form::json_schema` for an agent-tool surface. Its own feature rather than a
+# corner of `logs`: an agent surface wants the schema and has no reason to want
+# JSONL log parsing, and the return type is `serde_json::Value`, so a consumer
+# calling it depends on serde_json regardless.
+schema = ["dep:serde_json"]
 # Derive serde on the form model, so a consumer can load a Form from whatever
 # format they already use — YAML, JSON, TOML, RON. squelch takes no format
 # dependency of its own; you bring the deserializer.

@@ -180,6 +180,23 @@ impl Form {
     /// Guidance rides in HTML comments so it can be left in place and still be
     /// stripped on the way back by [`Form::parse_skeleton`].
     pub fn skeleton(&self) -> String {
+        // Guidance rides in an HTML comment, so any text interpolated into it
+        // must not be able to close it. A description containing `-->` ended
+        // the comment early and the remainder rendered as literal text in the
+        // reporter's editor; a description containing a newline escaped it
+        // entirely and became content in the parsed answer.
+        //
+        // Escaped rather than re-mechanised. Switching to git's `#`-prefixed
+        // convention was considered and rejected: with `## <id>` as the heading
+        // syntax, stripping `# ` lines would silently swallow a reporter's own
+        // markdown headings — the same silent-loss failure this guards against.
+        fn guidance(text: &str) -> String {
+            let flattened: String = text
+                .chars()
+                .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+                .collect();
+            flattened.replace("-->", "--\u{200b}>")
+        }
         let mut out = String::new();
         for field in &self.fields {
             match &field.kind {
@@ -187,21 +204,21 @@ impl Form {
                 FieldKind::Checkboxes { .. } => {
                     out.push_str(&format!(
                         "\n<!-- \"{}\" is confirmed by you, not by this tool. -->\n",
-                        field.label
+                        guidance(&field.label)
                     ));
                 }
                 _ if field.machine_filled => {
                     out.push_str(&format!(
                         "\n<!-- \"{}\" is filled in automatically. -->\n",
-                        field.label
+                        guidance(&field.label)
                     ));
                 }
                 _ => {
                     out.push_str(&format!("\n## {}\n", field.id));
                     if let Some(description) = &field.description {
-                        out.push_str(&format!("<!-- {description} -->\n"));
+                        out.push_str(&format!("<!-- {} -->\n", guidance(description)));
                     } else {
-                        out.push_str(&format!("<!-- {} -->\n", field.label));
+                        out.push_str(&format!("<!-- {} -->\n", guidance(&field.label)));
                     }
                     out.push('\n');
                 }
@@ -218,13 +235,33 @@ impl Form {
     pub fn parse_skeleton(text: &str) -> Vec<(String, String)> {
         let mut out: Vec<(String, String)> = Vec::new();
         let mut current: Option<String> = None;
-        let mut in_fence = false;
+        // Which marker opened the current fence, so a ``` block is closed by
+        // ``` and not by a stray ~~~ inside it. One flag for both let a
+        // legitimate `~~~` in a shell transcript close the block early, after
+        // which the next `##` split the content across sections it never
+        // belonged to.
+        let mut fence: Option<&str> = None;
 
         for line in text.lines() {
             let trimmed = line.trim();
-            if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-                in_fence = !in_fence;
-            } else if !in_fence {
+            // Four-space indentation is a code block in CommonMark, so a `##`
+            // there is content. Treating it as a heading invented a section and
+            // silently emptied the real one.
+            let indented = line.starts_with("    ") || line.starts_with('\t');
+            let marker = if trimmed.starts_with("```") {
+                Some("```")
+            } else if trimmed.starts_with("~~~") {
+                Some("~~~")
+            } else {
+                None
+            };
+            if let Some(marker) = marker {
+                match fence {
+                    Some(open) if open == marker => fence = None,
+                    Some(_) => {}
+                    None => fence = Some(marker),
+                }
+            } else if fence.is_none() && !indented {
                 if let Some(heading) = trimmed.strip_prefix("## ") {
                     current = Some(heading.trim().to_string());
                     continue;
@@ -255,7 +292,7 @@ impl Form {
     /// Deliberately describes only what a machine may fill: attestations and
     /// machine-filled blocks are excluded, so an agent cannot be asked to tick
     /// a confirmation box.
-    #[cfg(feature = "logs")]
+    #[cfg(feature = "schema")]
     pub fn json_schema(&self) -> serde_json::Value {
         let mut properties = serde_json::Map::new();
         for field in self.prompts() {
@@ -268,10 +305,26 @@ impl Form {
             spec.insert("description".into(), description.into());
             properties.insert(field.id.clone(), spec.into());
         }
+        // Required is derived from `prompts()`, NOT from `required_ids()`.
+        // The two answer different questions: `required_ids` is what the
+        // REPORT must carry before it may be built, which includes
+        // machine-filled blocks like `environment` — the application supplies
+        // those. `properties` here lists only what an agent may fill.
+        //
+        // Using `required_ids` made the schema unsatisfiable: `environment`
+        // appeared under `required` but not under `properties`, and with
+        // `additionalProperties: false` an agent could neither omit it nor
+        // supply it. Every conforming object was rejected.
+        let required: Vec<String> = self
+            .prompts()
+            .filter(|field| field.required)
+            .map(|field| field.id.clone())
+            .collect();
+
         serde_json::json!({
             "type": "object",
             "properties": properties,
-            "required": self.required_ids(),
+            "required": required,
             "additionalProperties": false,
         })
     }
@@ -559,7 +612,7 @@ mod tests {
         assert!(!parsed.iter().any(|(id, _)| id == "install"));
     }
 
-    #[cfg(feature = "logs")]
+    #[cfg(feature = "schema")]
     #[test]
     fn json_schema_describes_only_fillable_fields() {
         let schema = form().json_schema();
@@ -605,5 +658,68 @@ mod tests {
 
         // Markdown blocks carry no answer.
         assert!(form.fields.iter().any(|f| f.kind == FieldKind::Markdown));
+    }
+
+    #[test]
+    fn a_tilde_fence_does_not_close_a_backtick_fence() {
+        // A shell transcript containing `~~~` closed the ``` block early, and
+        // the next `##` then split the reporter's content across sections it
+        // never belonged to.
+        let parsed = Form::parse_skeleton(
+            "## reproduction\nRun:\n```sh\n~~~\n## not a heading\n```\nThen it dies.\n",
+        );
+        let repro = &parsed
+            .iter()
+            .find(|(id, _)| id == "reproduction")
+            .expect("reproduction survived")
+            .1;
+        assert!(repro.contains("## not a heading"), "{repro}");
+        assert!(repro.contains("Then it dies."), "{repro}");
+        assert!(!parsed.iter().any(|(id, _)| id == "not a heading"));
+    }
+
+    #[test]
+    fn an_indented_heading_is_code_not_structure() {
+        // Four spaces is a code block in CommonMark. Treating the `##` there as
+        // a heading invented a section and silently emptied the real one.
+        let parsed = Form::parse_skeleton("## reproduction\n    ## indented\nreal content\n");
+        assert!(
+            parsed.iter().any(|(id, _)| id == "reproduction"),
+            "the real section was emptied: {parsed:?}"
+        );
+        assert!(!parsed.iter().any(|(id, _)| id == "indented"), "{parsed:?}");
+    }
+
+    #[test]
+    fn a_description_cannot_close_the_comment_it_rides_in() {
+        // `-->` inside guidance ended the comment early, so the rest rendered
+        // as literal text in the reporter's editor — and a newline escaped it
+        // altogether, turning guidance into the reporter's answer.
+        let form =
+            Form::new([Field::textarea("repro", "Repro")
+                .describe("hostile --> escape\nand a newline --> too")]);
+        let skeleton = form.skeleton();
+
+        let guidance: Vec<&str> = skeleton
+            .lines()
+            .filter(|line| line.trim_start().starts_with("<!--"))
+            .collect();
+        assert_eq!(guidance.len(), 1, "guidance split across lines: {skeleton}");
+        assert_eq!(
+            guidance[0].matches("-->").count(),
+            1,
+            "the comment is closed more than once: {skeleton}"
+        );
+
+        // And the reporter's own answer is unaffected by it.
+        let filled = skeleton.replace("## repro\n", "## repro\nit crashes\n");
+        let parsed = Form::parse_skeleton(&filled);
+        assert_eq!(
+            parsed
+                .iter()
+                .find(|(id, _)| id == "repro")
+                .map(|(_, value)| value.as_str()),
+            Some("it crashes")
+        );
     }
 }

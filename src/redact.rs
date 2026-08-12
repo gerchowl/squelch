@@ -94,12 +94,34 @@ impl Record {
     /// Render as a single line. A record is always one line — see
     /// [`sanitize_for_block`].
     pub fn render(&self) -> String {
-        let mut out = format!("{} {:>5}", self.timestamp, self.level);
+        // Every part is sanitized HERE rather than only where records are
+        // parsed, because this is the one choke point a value must pass to
+        // become text. Two ways in were open otherwise:
+        //
+        // - `timestamp`, `level` and `source` never went through the JSONL
+        //   path's escaping, so a log line whose timestamp carried a newline
+        //   and a fence broke out of the block and landed as live markdown.
+        // - every field of `Record` is `pub` and [`crate::Report::diagnostics`]
+        //   takes any `IntoIterator<Item = Record>`, so an application that
+        //   builds records from its own logging stack — an entirely ordinary
+        //   thing to do — bypassed escaping completely.
+        //
+        // `sanitize_for_block` is idempotent, so the JSONL path escaping the
+        // value earlier costs nothing here.
+        let mut out = format!(
+            "{} {:>5}",
+            sanitize_for_block(&self.timestamp),
+            sanitize_for_block(&self.level)
+        );
         if let Some(source) = &self.source {
-            out.push_str(&format!(" [{source}]"));
+            out.push_str(&format!(" [{}]", sanitize_for_block(source)));
         }
         for (key, value) in &self.fields {
-            out.push_str(&format!(" {key}={value}"));
+            out.push_str(&format!(
+                " {}={}",
+                sanitize_for_block(key),
+                sanitize_for_block(value)
+            ));
         }
         out
     }
@@ -111,6 +133,7 @@ impl Record {
 /// [`Redactor::with_identity`] to supply the home directory and username
 /// explicitly — useful in tests, and for daemons whose environment has been
 /// stripped.
+#[derive(Clone)]
 pub struct Redactor {
     home: Option<String>,
     user: Option<String>,
@@ -208,7 +231,37 @@ impl Redactor {
 
     /// Scrub a single string.
     pub fn scrub(&self, value: &str) -> String {
-        let mut out = value.to_string();
+        // Strip invisibles only where one could hide a split credential:
+        // between two ASCII alphanumerics. A zero-width space inside
+        // `ghp_abc<zwsp>def` defeats every character-class run below and
+        // renders as nothing, so a reviewer sees an intact token. Stripping
+        // unconditionally was worse than the problem — U+200D between emoji is
+        // a grapheme joiner, and removing it turned one glyph into three.
+        let chars: Vec<char> = value.chars().collect();
+        let invisible = |c: char| {
+            matches!(c,
+                '\u{200b}'..='\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{feff}'
+            )
+        };
+        let mut stripped = String::with_capacity(value.len());
+        for (index, ch) in chars.iter().enumerate() {
+            let hides_a_secret = invisible(*ch)
+                && index
+                    .checked_sub(1)
+                    .and_then(|i| chars.get(i))
+                    .is_some_and(|c| c.is_ascii_alphanumeric())
+                && chars
+                    .get(index + 1)
+                    .is_some_and(|c| c.is_ascii_alphanumeric());
+            if !hides_a_secret {
+                stripped.push(*ch);
+            }
+        }
+        let mut out = stripped;
 
         // Swap public hosts out before the host rule runs, and back after.
         // A negative lookahead is not available in this regex engine, and
@@ -228,10 +281,10 @@ impl Redactor {
         for (pattern, replacement) in [
             (git_remote_re(), "<git-remote>"),
             (secret_token_re(), "<redacted-token>"),
-            (labeled_secret_re(), "$1=<redacted>"),
+            (labeled_secret_re(), "${1}${2}${3}${4}=<redacted>"),
             (email_re(), "<email>"),
             (ssh_target_re(), "<ssh-target>"),
-            (ipv6_re(), "<ip>"),
+            (ipv6_re(), "${1}<ip>${3}"),
             (ipv4_re(), "<ip>"),
             (private_host_re(), "<host>"),
         ] {
@@ -244,11 +297,28 @@ impl Redactor {
 
         // This user's home first (most specific), then anyone else's.
         if let Some(home) = &self.home {
-            out = out.replace(home.as_str(), "~");
+            // Bounded, not a bare substring replace: with HOME `/Users/alice`,
+            // `/Users/aliceOLD/x` became `~OLD/x`, which discloses that a
+            // sibling account exists and half-names it.
+            let bounded = Regex::new(&format!(r"{}(?:/|\b)", regex::escape(home)))
+                .expect("escaped home pattern");
+            out = bounded
+                .replace_all(&out, |caps: &regex::Captures| {
+                    if caps[0].ends_with('/') {
+                        "~/".to_string()
+                    } else {
+                        "~".to_string()
+                    }
+                })
+                .to_string();
         }
         out = home_path_re().replace_all(&out, "<path>").to_string();
         if let Some(user) = &self.user {
-            out = out.replace(user.as_str(), "<user>");
+            // Case-insensitive: logs and macOS paths preserve display case, so
+            // `ATTACKER` and `Attacker` walked straight past a plain replace.
+            let cased =
+                Regex::new(&format!(r"(?i){}", regex::escape(user))).expect("escaped user pattern");
+            out = cased.replace_all(&out, "<user>").to_string();
         }
         out
     }
@@ -275,9 +345,18 @@ impl Redactor {
         let value: serde_json::Value = serde_json::from_str(line).ok()?;
         let object = value.as_object()?;
 
-        let timestamp = first_str(object, &["timestamp", "ts", "time", "@timestamp"])?;
-        let level =
-            first_str(object, &["level", "severity", "lvl"]).unwrap_or_else(|| "INFO".to_string());
+        // Scrubbed like any other value. These two were pulled straight out
+        // of the JSON and rendered verbatim, so a log line could carry a home
+        // path, a token or an address in its `timestamp` and have it published
+        // untouched — the allowlist protected every field except the two that
+        // are always present.
+        let timestamp = self.scrub(&first_str(
+            object,
+            &["timestamp", "ts", "time", "@timestamp"],
+        )?);
+        let level = self.scrub(
+            &first_str(object, &["level", "severity", "lvl"]).unwrap_or_else(|| "INFO".to_string()),
+        );
 
         let mut fields: Vec<(String, String)> = Vec::new();
 
@@ -344,6 +423,26 @@ pub fn sanitize_for_block(value: &str) -> String {
         .replace("~~~", "~\u{200b}~\u{200b}~")
         .replace("</details", "<\u{200b}/details")
         .replace("<summary", "<\u{200b}summary")
+}
+
+/// Make a value safe to place in markdown **body text**, outside any fence.
+///
+/// [`sanitize_for_block`] is enough inside a ```` ```text ```` region, where
+/// HTML is inert because the fence makes it literal. Provenance entries have
+/// no such fence: they are rendered as `- Label: value` list items, so an
+/// `<img src=x onerror=…>` in a value is live HTML the moment the issue is
+/// viewed. GitHub strips `<script>` and renders that one.
+///
+/// So this flattens the value as for a block, then escapes the two characters
+/// that let HTML start. Markdown emphasis can still apply and is left alone —
+/// it is cosmetic, and escaping every metacharacter would make an environment
+/// block unreadable for no security gain.
+///
+/// Not idempotent: `&` becomes `&amp;`, so apply it exactly once, at render.
+pub fn sanitize_inline(value: &str) -> String {
+    sanitize_for_block(value)
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
 }
 
 /// Cap a value so one pathological record cannot eat the whole issue body.
@@ -469,9 +568,17 @@ fn secret_token_re() -> &'static Regex {
             r"(?x)
               gh[pousr]_[A-Za-z0-9]{16,}
             | github_pat_[A-Za-z0-9_]{20,}
+            # Stripe and friends separate with `_`, not `-`; requiring the dash
+            # let every `sk_live_…` through.
+            | [sr]k_(?:live|test)_[A-Za-z0-9]{16,}
             | sk-[A-Za-z0-9_\-]{20,}
             | xox[baprs]-[A-Za-z0-9\-]{10,}
-            | AKIA[0-9A-Z]{16}
+            # The whole AWS key-id family, not just long-lived user keys. ASIA
+            # (STS session) is the one a compromised CI actually leaks.
+            | (?:AKIA|ASIA|AIDA|AROA|AGPA|AIPA|ANPA|ANVA|APKA)[0-9A-Z]{16}
+            # Private key material: mask the armour, since the base64 body that
+            # follows is on its own lines and matches nothing else here.
+            | -----BEGIN[A-Z ]*PRIVATE\ KEY-----
             | eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}
             ",
         )
@@ -487,7 +594,32 @@ fn labeled_secret_re() -> &'static Regex {
         // `\b` does not help there — `_` is a word character, so there is no
         // boundary before `token` and a `\btoken\b` rule never fires.
         Regex::new(
-            r"(?i)(?:^|[^A-Za-z0-9])(\w*(?:authorization|bearer|token|password|passwd|secret|credentials?|cookie|session|api[-_]?key))\s*[=:]\s*\S+",
+            r#"(?ix)
+              # `Bearer <token>` / `Basic <base64>`: separated by a SPACE, so
+              # the `[=:]` form below never fired and the token rode along in
+              # the clear behind a masked `Authorization=`.
+              (^|[^A-Za-z0-9])((?:bearer|basic))\s+[A-Za-z0-9._\-+/=]{8,}
+              # The leading delimiter is CAPTURED, not consumed. Swallowing it
+              # ran words together and, worse, ate newlines — joining a secret's
+              # line to the one before it and hiding where it came from.
+              #
+              # The optional quotes around the separator are what let a secret
+              # inside a JSON payload match: `{"token":"value"}` puts a `"`
+              # between the label and the colon, and `err`/`message` fields
+              # routinely carry JSON from downstream services.
+            | (^|[^A-Za-z0-9])
+              (\w*(?:
+                  authorization|bearer|token|password|passwd|pwd|passphrase
+                | secret|credentials?|cookie|auth
+                | session(?:[-_]?id)?
+                | api[-_]?key|access[-_]?key|private[-_]?key
+              ))
+              # The trailing quote is NOT consumed here: the quoted-value
+              # alternative below has to see it, or `password="hunter 2"`
+              # matches only `hunter` and publishes ` 2"`.
+              "?\s*[=:]\s*
+              (?:"[^"]*"|'[^']*'|(?:bearer|basic)\s+\S+|[^\s"',;]+)
+            "#,
         )
         .expect("static labeled-secret pattern")
     })
@@ -511,8 +643,23 @@ fn ssh_target_re() -> &'static Regex {
 fn ipv6_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r"\[?(?:[0-9A-Fa-f]{1,4}:){2,7}[0-9A-Fa-f]{0,4}(?:%[A-Za-z0-9]+)?\]?")
-            .expect("static ipv6 pattern")
+        // Delimited on both sides. Without that, the compressed alternative
+        // matched `d::c` inside `std::collections::HashMap`, so every Rust log
+        // line and backtrace came out corrupted mid-word. The engine has no
+        // lookaround, so the delimiters are captured and restored.
+        Regex::new(
+            r"(?x)
+              (^|[^0-9A-Za-z_:.])
+              (
+                (?:[0-9A-Fa-f]{1,4}:){2,7}[0-9A-Fa-f]{1,4}
+              | (?:[0-9A-Fa-f]{1,4}:)+:(?:[0-9A-Fa-f]{1,4}:?)*[0-9A-Fa-f]{0,4}
+              | ::(?:[0-9A-Fa-f]{1,4}:)*[0-9A-Fa-f]{1,4}
+              )
+              (?:%[A-Za-z0-9]+)?
+              ($|[^0-9A-Za-z_:.])
+            ",
+        )
+        .expect("static ipv6 pattern")
     })
 }
 
@@ -540,8 +687,13 @@ fn private_host_re() -> &'static Regex {
     RE.get_or_init(|| {
         Regex::new(
             r"(?xi)
-              \b[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*\.(?:corp|internal|intranet|local|lan|home|priv|private|arpa)\b
-            | \b[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+){2,}\.[A-Za-z]{2,}\b
+              [A-Za-z0-9_\-]+(?:\.[A-Za-z0-9_\-]+)*\.(?:corp|internal|intranet|local|lan|home|priv|private|arpa)\b
+            # Four labels, and case-sensitive: hostnames are conventionally
+            # lowercase, while a capitalised label means a class name. Three
+            # labels ate `config.yml.bak` and `os.path.join`; case-insensitivity
+            # ate `java.lang.Thread.run`. A capitalised host under a private
+            # suffix is still caught by the rule above.
+            | (?-i:[a-z0-9_\-]+(?:\.[a-z0-9_\-]+){2,}\.[a-z]{2,})\b
             ",
         )
         .expect("static private-host pattern")
@@ -555,8 +707,18 @@ fn home_path_re() -> &'static Regex {
     RE.get_or_init(|| {
         Regex::new(
             r"(?xi)
-              (?:/Users|/home)/[A-Za-z0-9._\-]+(?:/[^\s\x22]*)?
+              (?:/Users|/home)/[^\s\x22/]+(?:/[^\s\x22]*)?
+            # Root's home is still an account's home, and a path under it says
+            # the process ran privileged.
+            | /var/root\b(?:/[^\s\x22]*)?
+            | /root\b(?:/[^\s\x22]*)?
+            # macOS per-user temp: the salt uniquely identifies the user.
+            | /private/var/folders/[^\s\x22]*
+            | /var/folders/[^\s\x22]*
+            # `~alice/.bashrc` names the account without any /home prefix.
+            | ~[A-Za-z0-9._\-]+(?:/[^\s\x22]*)?
             | [A-Z]:\\Users\\[^\\/\s\x22]+(?:\\[^\s\x22]*)?
+            | [A-Z]:\\Documents\ and\ Settings\\[^\\/\s\x22]+(?:\\[^\s\x22]*)?
             ",
         )
         .expect("static home-path pattern")
@@ -740,6 +902,62 @@ mod tests {
                 assert!(!out.contains(forbidden), "leaked {forbidden:?} in {out}");
             }
             assert!(out.contains("event=remote.install"), "{out}");
+        }
+    }
+
+    #[test]
+    fn code_shaped_text_is_not_mistaken_for_a_host_or_an_address() {
+        // Every string here was destroyed by a redaction fix at some point.
+        // Over-masking is not the safe direction: a block scrubbed into
+        // uselessness costs the same triage round trip as no block at all.
+        let redactor = redactor();
+        for intact in [
+            // `d::c` inside this matched the compressed-IPv6 rule.
+            "std::collections::HashMap",
+            "std::io::Error",
+            "app::db::conn",
+            // Dotted identifiers are not FQDNs.
+            "com.example.Main",
+            "at java.lang.Thread.run",
+            "org.apache.commons.Lang",
+            "os.path.join",
+            "django.db.models",
+            // Filenames with two extensions are not FQDNs either.
+            "config.yml.bak",
+            "foo.tar.gz",
+            "lib.rs.orig",
+            // A prefix is not a path.
+            "/roots",
+            "/rootbeer",
+            "/var/rooted",
+        ] {
+            assert_eq!(
+                redactor.scrub(intact),
+                intact,
+                "{intact:?} must survive the scrubber intact"
+            );
+        }
+    }
+
+    #[test]
+    fn an_emoji_joiner_is_not_treated_as_a_hidden_credential() {
+        // Invisibles are stripped so a zero-width space cannot split a token,
+        // but U+200D between emoji is a grapheme joiner: removing it turns one
+        // glyph into three.
+        let redactor = redactor();
+        let family = "\u{1f469}\u{200d}\u{1f52c} ran the job";
+        assert_eq!(redactor.scrub(family), family);
+    }
+
+    #[test]
+    fn compressed_ipv6_is_still_masked_after_the_boundary_fix() {
+        let redactor = redactor();
+        for (input, expected) in [
+            ("peer fe80::1 down", "peer <ip> down"),
+            ("peer 2001::abcd down", "peer <ip> down"),
+            ("listening on ::1", "listening on <ip>"),
+        ] {
+            assert_eq!(redactor.scrub(input), expected, "{input:?}");
         }
     }
 }

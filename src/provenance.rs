@@ -163,9 +163,24 @@ impl Provenance {
 
     /// Render as the markdown bullet list an environment field expects.
     pub fn to_markdown(&self) -> String {
+        // Sanitized, and not only scrubbed. `scrubbed` masks identifying
+        // material; it does not stop a value from being READ as markdown.
+        // These entries are rendered as body text rather than inside a fence,
+        // so a value carrying a newline and a `##` or an `<img onerror=…>`
+        // lands as live markup in a public issue — no fence to break out of,
+        // because there was never one to begin with.
+        //
+        // Values here are routinely environment-derived (`SHELL`, `TERM`, the
+        // executable's own path), which is exactly the material an attacker
+        // upstream of the reporter can influence.
         let mut out = String::new();
         for (label, value) in &self.entries {
-            let _ = writeln!(out, "- {label}: {}", value.render());
+            let _ = writeln!(
+                out,
+                "- {}: {}",
+                crate::redact::sanitize_inline(label),
+                crate::redact::sanitize_inline(&value.render())
+            );
         }
         out
     }
@@ -173,7 +188,12 @@ impl Provenance {
     /// Scrub every value. Call before rendering if any entry may carry a path
     /// or hostname — the binary's own location usually does.
     pub fn scrubbed(mut self, redactor: &crate::Redactor) -> Self {
-        for (_, value) in &mut self.entries {
+        // Labels too. Only values were scrubbed, but a label is caller-supplied
+        // and an entirely reasonable one — `Hostname`, `Config path` — carries
+        // exactly the material this masks when the caller builds it from
+        // something dynamic.
+        for (label, value) in &mut self.entries {
+            *label = redactor.scrub(label);
             if let Value::Known(text) = value {
                 *text = redactor.scrub(text);
             }

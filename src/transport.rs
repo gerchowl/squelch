@@ -26,7 +26,12 @@
 
 use std::path::PathBuf;
 
-#[cfg(any(feature = "browser", feature = "endpoint"))]
+// `browser` only: every `Error::*` use in this file is in `open_in_browser`.
+// The endpoint route needs `Result` (imported below) but never names `Error`,
+// so including it here produced an unused-import warning for any consumer
+// building with `endpoint` and not `browser` — which breaks anyone compiling
+// with `#![deny(warnings)]`.
+#[cfg(feature = "browser")]
 use crate::error::Error;
 #[allow(unused_imports)]
 use crate::error::Result;
@@ -254,8 +259,8 @@ impl Transport {
     ///
     /// `gh` first — filing without leaving the terminal beats a browser round
     /// trip — then a browser, then a file the reporter can attach. Never
-    /// selects [`Transport::Endpoint`], which needs a URL only the embedder
-    /// has.
+    /// selects the `Endpoint` route (`endpoint` feature), which needs a URL
+    /// only the embedder has.
     ///
     /// This probes the environment, so call it once and reuse the result.
     /// Note that a route it picks may still require [`crate::Report::confirmed`]
