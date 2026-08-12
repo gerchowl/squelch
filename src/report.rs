@@ -298,7 +298,7 @@ impl Report {
                     "mailto:{}?subject={}&body={}",
                     percent_address(to),
                     percent(&subject),
-                    percent(&composed.body)
+                    percent("")
                 )))
             }
             Transport::File(path) => {
