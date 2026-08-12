@@ -48,12 +48,32 @@ The scrubber is an **allowlist over structured fields** — named fields are kep
 - credentials: `ghp_…`, `github_pat_…`, `sk-…`, `xox…`, AWS keys, JWTs
 - labelled secrets **including underscored ones** — `refresh_token=`, `client_secret=`, `api_key:` — which a naive `\btoken\b` rule silently misses, because `_` is a word character so there's no boundary before `token`
 - emails, `user@host` ssh targets, and git remotes with their org and repository name
-- IPv4 and IPv6
-- hostnames under private suffixes, and any FQDN of three or more labels
+- IPv4, and IPv6 **including compressed forms** — `::1`, `fe80::1`, `2001::abcd`
+  are what logs actually contain, and a rule needing two full `hex:` groups
+  misses all of them
+- hostnames under private suffixes, and any FQDN of three or more labels,
+  with `_` allowed in a label because SRV records and internal DNS use it
+
+Invisible characters are stripped **before** any rule runs. A zero-width space
+inside a credential breaks every character-class run, and renders as nothing —
+so a reviewer sees an intact token in the preview and no reason to object.
 
 An allowlist rather than a denylist because a denylist fails open the moment someone adds a log field, and nobody revisits a denylist when they add one. With an allowlist the worst case is a report that's less useful than it could be.
 
 There's a test pinning the strings that must *survive* — `No such file or directory (os error 2)`, `server.log`, `0.6.8-fork.85ce040` — because over-masking makes the block worthless just as surely as under-masking makes it dangerous.
+
+## Nothing reaches the tracker without passing one choke point
+
+Escaping happens where a value becomes text — `Record::render` and
+`Provenance::to_markdown` — not where a value is parsed. That matters because
+`Record`'s fields are public and `Report::diagnostics` takes any iterator of
+them, so an application mapping its own `tracing` output onto `Record` never
+touches the parser. Escaping at the parser would have covered the JSONL path
+and nothing else.
+
+The environment block is escaped differently from the log block, because it is
+not fenced: markup there has nothing to break out of, so `<` and `&` are
+entity-escaped rather than merely flattened.
 
 ## Values can't escape the markdown block
 
@@ -94,7 +114,9 @@ A missing `Shell:` line leaves a triager unable to tell "this reporter has no `S
 | `browser` | yes | open the prefilled form — no dependencies |
 | `logs` | yes | JSONL extraction (`serde_json`) |
 | `gh-cli` | no | create the issue with `gh` — no dependencies |
-| `endpoint` | no | POST to an endpoint you operate (`ureq`) |
+| `endpoint` | no | POST to an endpoint you operate (`ureq`, `serde_json`) |
+| `schema` | no | `Form::json_schema()` for an agent tool surface (`serde_json`) |
+| `serde` | no | derive serde on `Form`, so you can load it from your own YAML/JSON/TOML |
 
 With `default-features = false` the only dependency is `regex`, and it still redacts, builds URLs and renders bodies.
 
