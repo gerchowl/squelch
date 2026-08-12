@@ -115,9 +115,15 @@ pub use provenance::{Provenance, Value};
 pub use redact::{Record, Redactor};
 pub use report::{Composed, Report, Sent};
 pub use transport::Transport;
+// `Composed::url` is a public field of this type, so a consumer who binds it
+// has to be able to name it without reaching into the module path.
+pub use url::PrefilledUrl;
 
 #[cfg(feature = "endpoint")]
 pub use transport::Auth;
+// The type a consumer must name to build `Auth::Dynamic`.
+#[cfg(feature = "endpoint")]
+pub use transport::DynamicAuth;
 
 /// Start a [`Report`] aimed at the *calling* crate's `repository`.
 ///

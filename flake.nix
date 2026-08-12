@@ -28,17 +28,20 @@
         f:
         nixpkgs.lib.genAttrs systems (
           system:
-          f (
+          let
+            pkgs = import nixpkgs {
+              inherit system;
+              overlays = [ devkit.overlays.default ];
+            };
+          in
+          f pkgs (
             devkit.lib.mkRustProject {
               # devkit.overlays.default is NOT optional: mkProjectShell pulls
               # nix/devtools.nix, which references `vig-utils` from pkgs. A
               # plain nixpkgs makes `rust.devShell` throw `undefined variable
               # 'vig-utils'` while the checks still evaluate fine. Reported to
               # vig-os/devkit#1429.
-              pkgs = import nixpkgs {
-                inherit system;
-                overlays = [ devkit.overlays.default ];
-              };
+              inherit pkgs;
               src = ./.;
               # `--all-features`: squelch is mostly feature-gated — `gh-cli`,
               # `endpoint` and `serde` add tests and a good deal of code a
@@ -59,8 +62,42 @@
         );
     in
     {
-      devShells = forEachSystem (rust: { default = rust.devShell; });
-      checks = forEachSystem (rust: rust.checks);
-      packages = forEachSystem (rust: rust.packages);
+      devShells = forEachSystem (_: rust: { default = rust.devShell; });
+      packages = forEachSystem (_: rust: rust.packages);
+
+      checks = forEachSystem (
+        pkgs: rust:
+        rust.checks
+        // {
+          # Every feature combination must COMPILE — the pack's checks all run
+          # with one feature set, and `--all-features` is the set least likely
+          # to break. It hid a real one: `endpoint` uses `serde_json::json!`
+          # but did not depend on serde_json, so the crate failed to build for
+          # any consumer with `default-features = false, features = ["endpoint"]`
+          # while every check here stayed green.
+          #
+          # `--no-dev-deps` is the load-bearing flag. dev-dependencies list
+          # serde_json unconditionally, so anything built with tests links it
+          # anyway and the missing dependency stays invisible.
+          #
+          # Scoped to `-p squelch` because the feature matrix that matters is
+          # the published crate's; the demo app has no features of its own.
+          #
+          # Built through mkRustProject's documented escape hatches rather than
+          # a knob, because the pack has no feature-matrix check and its curated
+          # tool map has no cargo-hack entry.
+          feature-powerset = rust.craneLib.mkCargoDerivation (
+            rust.commonArgs
+            // {
+              inherit (rust) cargoArtifacts;
+              pnameSuffix = "-feature-powerset";
+              nativeBuildInputs = (rust.commonArgs.nativeBuildInputs or [ ]) ++ [ pkgs.cargo-hack ];
+              buildPhaseCargoCommand = ''
+                cargo hack check -p squelch --feature-powerset --no-dev-deps --locked
+              '';
+            }
+          );
+        }
+      );
     };
 }

@@ -133,6 +133,7 @@ impl Record {
 /// [`Redactor::with_identity`] to supply the home directory and username
 /// explicitly — useful in tests, and for daemons whose environment has been
 /// stripped.
+#[derive(Clone)]
 pub struct Redactor {
     home: Option<String>,
     user: Option<String>,

@@ -255,7 +255,7 @@ impl Form {
     /// Deliberately describes only what a machine may fill: attestations and
     /// machine-filled blocks are excluded, so an agent cannot be asked to tick
     /// a confirmation box.
-    #[cfg(feature = "logs")]
+    #[cfg(feature = "schema")]
     pub fn json_schema(&self) -> serde_json::Value {
         let mut properties = serde_json::Map::new();
         for field in self.prompts() {
@@ -559,7 +559,7 @@ mod tests {
         assert!(!parsed.iter().any(|(id, _)| id == "install"));
     }
 
-    #[cfg(feature = "logs")]
+    #[cfg(feature = "schema")]
     #[test]
     fn json_schema_describes_only_fillable_fields() {
         let schema = form().json_schema();

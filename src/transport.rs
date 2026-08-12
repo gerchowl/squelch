@@ -26,7 +26,12 @@
 
 use std::path::PathBuf;
 
-#[cfg(any(feature = "browser", feature = "endpoint"))]
+// `browser` only: every `Error::*` use in this file is in `open_in_browser`.
+// The endpoint route needs `Result` (imported below) but never names `Error`,
+// so including it here produced an unused-import warning for any consumer
+// building with `endpoint` and not `browser` — which breaks anyone compiling
+// with `#![deny(warnings)]`.
+#[cfg(feature = "browser")]
 use crate::error::Error;
 #[allow(unused_imports)]
 use crate::error::Result;
