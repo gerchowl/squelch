@@ -94,12 +94,34 @@ impl Record {
     /// Render as a single line. A record is always one line — see
     /// [`sanitize_for_block`].
     pub fn render(&self) -> String {
-        let mut out = format!("{} {:>5}", self.timestamp, self.level);
+        // Every part is sanitized HERE rather than only where records are
+        // parsed, because this is the one choke point a value must pass to
+        // become text. Two ways in were open otherwise:
+        //
+        // - `timestamp`, `level` and `source` never went through the JSONL
+        //   path's escaping, so a log line whose timestamp carried a newline
+        //   and a fence broke out of the block and landed as live markdown.
+        // - every field of `Record` is `pub` and [`crate::Report::diagnostics`]
+        //   takes any `IntoIterator<Item = Record>`, so an application that
+        //   builds records from its own logging stack — an entirely ordinary
+        //   thing to do — bypassed escaping completely.
+        //
+        // `sanitize_for_block` is idempotent, so the JSONL path escaping the
+        // value earlier costs nothing here.
+        let mut out = format!(
+            "{} {:>5}",
+            sanitize_for_block(&self.timestamp),
+            sanitize_for_block(&self.level)
+        );
         if let Some(source) = &self.source {
-            out.push_str(&format!(" [{source}]"));
+            out.push_str(&format!(" [{}]", sanitize_for_block(source)));
         }
         for (key, value) in &self.fields {
-            out.push_str(&format!(" {key}={value}"));
+            out.push_str(&format!(
+                " {}={}",
+                sanitize_for_block(key),
+                sanitize_for_block(value)
+            ));
         }
         out
     }
@@ -344,6 +366,26 @@ pub fn sanitize_for_block(value: &str) -> String {
         .replace("~~~", "~\u{200b}~\u{200b}~")
         .replace("</details", "<\u{200b}/details")
         .replace("<summary", "<\u{200b}summary")
+}
+
+/// Make a value safe to place in markdown **body text**, outside any fence.
+///
+/// [`sanitize_for_block`] is enough inside a ```` ```text ```` region, where
+/// HTML is inert because the fence makes it literal. Provenance entries have
+/// no such fence: they are rendered as `- Label: value` list items, so an
+/// `<img src=x onerror=…>` in a value is live HTML the moment the issue is
+/// viewed. GitHub strips `<script>` and renders that one.
+///
+/// So this flattens the value as for a block, then escapes the two characters
+/// that let HTML start. Markdown emphasis can still apply and is left alone —
+/// it is cosmetic, and escaping every metacharacter would make an environment
+/// block unreadable for no security gain.
+///
+/// Not idempotent: `&` becomes `&amp;`, so apply it exactly once, at render.
+pub fn sanitize_inline(value: &str) -> String {
+    sanitize_for_block(value)
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
 }
 
 /// Cap a value so one pathological record cannot eat the whole issue body.

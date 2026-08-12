@@ -40,6 +40,18 @@ struct Cli {
     #[arg(long, global = true)]
     workdir: Option<String>,
 
+    /// Attach a `Record` built by hand from this text, rather than parsed from
+    /// JSONL by the redactor.
+    ///
+    /// Not a contrivance: `Record`'s fields are all public and
+    /// `Report::diagnostics` accepts any `IntoIterator<Item = Record>`, so an
+    /// application that already holds structured logs in memory — a `tracing`
+    /// layer, a ring buffer — is expected to build them directly. That path
+    /// never touches `Redactor`, so it is the one that has to prove it still
+    /// cannot inject markup.
+    #[arg(long, global = true)]
+    raw_record: Option<String>,
+
     #[command(subcommand)]
     route: Route,
 }
@@ -100,7 +112,7 @@ fn run() -> Result<String, Box<dyn std::error::Error>> {
         provenance = provenance.with("Workdir", Value::known(workdir));
     }
 
-    let diagnostics = match &cli.log {
+    let mut diagnostics = match &cli.log {
         Some(path) => {
             let text = std::fs::read_to_string(path)?;
             let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
@@ -108,6 +120,18 @@ fn run() -> Result<String, Box<dyn std::error::Error>> {
         }
         None => Vec::new(),
     };
+
+    if let Some(text) = &cli.raw_record {
+        // Every part hostile on purpose, and none of it passed through the
+        // redactor — the shape an embedding application produces when it maps
+        // its own log events onto `Record`.
+        diagnostics.push(squelch::Record {
+            timestamp: text.clone(),
+            level: text.clone(),
+            source: Some(text.clone()),
+            fields: vec![(text.clone(), text.clone())],
+        });
+    }
 
     let transport = match &cli.route {
         Route::Preview => Transport::Browser,
