@@ -49,7 +49,11 @@ fn prefilled_ids(source: &str) -> BTreeSet<String> {
         .map(|caps| caps[1].to_string())
         .collect();
     for list in require.captures_iter(source) {
-        ids.extend(quoted.captures_iter(&list[1]).map(|caps| caps[1].to_string()));
+        ids.extend(
+            quoted
+                .captures_iter(&list[1])
+                .map(|caps| caps[1].to_string()),
+        );
     }
     ids
 }

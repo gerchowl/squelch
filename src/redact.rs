@@ -33,10 +33,34 @@
 //!   `_` is a word character and so there is no boundary before `token`
 //! - email addresses, `user@host` ssh targets, and git remotes with their org
 //!   and repository name
-//! - IPv4 and IPv6
-//! - hostnames under private suffixes, and any FQDN of three or more labels
+//! - IPv4, IPv6 and MAC addresses
+//! - hostnames under private suffixes, and FQDNs of three or more labels whose
+//!   final label is a real suffix
+//! - identifiers *labelled* as naming the machine — `machine-id`, `serial`,
+//!   `udid`, `imei`
 //!
 //! # What it deliberately does not cover
+//!
+//! **Encoded secrets.** A base64, hex or `\u`-escaped token matches nothing
+//! here. Decoding every candidate run to search inside it is a different tool
+//! with a different cost, and the decoded-and-re-encoded search space has no
+//! natural floor. What contains encoded credentials in practice is a JSON
+//! error body from a downstream service, and the labelled-secret rule catches
+//! those by their key rather than their contents.
+//!
+//! **Bare UUIDs.** Request ids, trace ids and span ids are UUIDs, and they are
+//! the thread a maintainer follows through a log. Masking them costs the
+//! report the one thing that makes it followable, for a machine id that is
+//! only a machine id when something says so — which is why the label, not the
+//! shape, is what fires the rule.
+//!
+//! **Hostnames on unusual suffixes.** The FQDN rule tests the final label
+//! against a list, because without one it cannot tell
+//! `bastion.corp.acme.com` from `django.contrib.auth.models` — they have the
+//! same shape, and masking the second cost a Django traceback the line that
+//! says where the bug is. A host under a suffix not on that list is not
+//! matched by *this* rule; the private-suffix, `user@host` and git-remote
+//! rules are what cover the shapes that carry a name in practice.
 //!
 //! Free-form user prose. If your reporter types their employer's name into the
 //! description field, that is their disclosure to make — the crate's job is to
@@ -288,9 +312,15 @@ impl Redactor {
         for (pattern, replacement) in [
             (git_remote_re(), "<git-remote>"),
             (secret_token_re(), "<redacted-token>"),
+            // Before `labeled_secret_re`, which would otherwise consume the
+            // `id=` and leave the identifier itself standing.
+            (machine_id_re(), "${1}${2}=<machine-id>"),
             (labeled_secret_re(), "${1}${2}${3}${4}=<redacted>"),
             (email_re(), "<email>"),
             (ssh_target_re(), "<ssh-target>"),
+            // Before the IPv6 rule, whose colon-run alternative would claim a
+            // colon-form MAC and report it as an address.
+            (mac_address_re(), "${1}<mac>${2}"),
             (ipv6_re(), "${1}<ip>${3}"),
             (ipv4_re(), "<ip>"),
             (private_host_re(), "<host>"),
@@ -319,7 +349,11 @@ impl Redactor {
                 })
                 .to_string();
         }
-        out = home_path_re().replace_all(&out, "<path>").to_string();
+        // `${1}` restores the captured left delimiter. The tilde alternative
+        // needs one — with no boundary before `~`, every `HEAD~1` in a pasted
+        // git command became `HEAD<path>` — and this engine has no lookaround,
+        // so the delimiter is captured and put back rather than looked past.
+        out = home_path_re().replace_all(&out, "${1}<path>").to_string();
         if let Some(user) = &self.user {
             // Case-insensitive: logs and macOS paths preserve display case, so
             // `ATTACKER` and `Attacker` walked straight past a plain replace.
@@ -558,9 +592,22 @@ fn git_remote_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r"(?x)
+            // `(?i)`: a scheme is case-insensitive per RFC 3986, and `HTTPS://`
+            // is what a Windows shell and a good many log formatters emit. The
+            // rule was case-sensitive, so shifting two characters defeated it.
+            r"(?ix)
               \bgit@[A-Za-z0-9._\-]+:[^\s\x22]+
             | \bssh://[^\s\x22]+
+            # A named forge, with or without `.git`. Requiring the suffix meant
+            # the rule missed the form git itself prints — `fatal: repository
+            # 'https://github.com/acme/prod-vault/' not found` — and every URL
+            # a human pastes from a browser. The path is consumed to the end so
+            # `/pull/42` and `/-/tree/main` cannot leave a tail behind.
+            | \bhttps?://(?:www\.)?(?:github|gitlab|bitbucket|codeberg|sr\.ht)\.[a-z]+/[^\s\x22]*
+            # Any other host, still requiring `.git`: without a known forge
+            # there is nothing to distinguish a repository URL from an ordinary
+            # link, and masking every URL in a log would take the diagnosis
+            # with it.
             | \bhttps?://[A-Za-z0-9._\-]+/[A-Za-z0-9._\-]+/[A-Za-z0-9._\-]+\.git
             ",
         )
@@ -580,12 +627,28 @@ fn secret_token_re() -> &'static Regex {
             | [sr]k_(?:live|test)_[A-Za-z0-9]{16,}
             | sk-[A-Za-z0-9_\-]{20,}
             | xox[baprs]-[A-Za-z0-9\-]{10,}
+            # Slack's app-level token (Socket Mode) is not an `xox` at all.
+            | xapp-[0-9]-[A-Za-z0-9\-]{10,}
+            # Google API keys — Firebase, Maps, Places, Cloud. A fixed prefix
+            # and a fixed length, and it was not in the list.
+            | AIza[0-9A-Za-z_\-]{35}
+            # Telegram bot tokens: `<bot id>:AA<secret>`. The `AA` prefix is
+            # what keeps this from matching an ordinary `id:value` pair.
+            | \b[0-9]{6,12}:AA[A-Za-z0-9_\-]{30,}
+            # Discord and Firebase custom tokens: three base64url segments,
+            # like a JWT but without the `eyJ` header that the rule below
+            # anchors on.
+            | \b[MNO][A-Za-z0-9_\-]{22,}\.[A-Za-z0-9_\-]{5,8}\.[A-Za-z0-9_\-]{25,}
             # The whole AWS key-id family, not just long-lived user keys. ASIA
             # (STS session) is the one a compromised CI actually leaks.
             | (?:AKIA|ASIA|AIDA|AROA|AGPA|AIPA|ANPA|ANVA|APKA)[0-9A-Z]{16}
             # Private key material: mask the armour, since the base64 body that
             # follows is on its own lines and matches nothing else here.
-            | -----BEGIN[A-Z ]*PRIVATE\ KEY-----
+            # The space is ESCAPED. `(?x)` strips whitespace inside a character
+            # class too, not only between tokens, so `[A-Z ]*` compiled as
+            # `[A-Z]*` and this rule required `-----BEGINPRIVATE KEY-----`.
+            # It matched no armour any tool has ever emitted.
+            | -----BEGIN[A-Z\ ]*PRIVATE\ KEY-----
             | eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}
             ",
         )
@@ -680,6 +743,52 @@ fn ipv4_re() -> &'static Regex {
     })
 }
 
+/// Hardware addresses, which name the machine rather than the network.
+///
+/// Colon-form MACs were already masked, but only by accident: they collide
+/// with the IPv6 rule. Dash-form had nothing at all, and it is the form
+/// Windows, `ip link` and most driver logs print.
+fn mac_address_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            // The delimiters are captured and restored, as elsewhere: without
+            // a boundary this bites into the middle of a long hex run.
+            r"(?xi)
+              (^|[^0-9A-Za-z:\-])
+              (?:(?:[0-9A-F]{2}-){5}[0-9A-F]{2}|(?:[0-9A-F]{2}:){5}[0-9A-F]{2})
+              ($|[^0-9A-Za-z:\-])
+            ",
+        )
+        .expect("static mac pattern")
+    })
+}
+
+/// An identifier that has been *labelled* as naming the machine.
+///
+/// A bare UUID is deliberately left alone. Request ids, trace ids and span ids
+/// are UUIDs, they are the thread a maintainer follows through a log, and
+/// masking them costs the report the one thing that makes it followable. The
+/// label is what turns the same bytes into a claim about the hardware.
+fn machine_id_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?xi)
+              (^|[^A-Za-z0-9_])
+              ((?:machine|device|hardware|hw|installation|install|node|host)
+                 [-_\ ]?(?:id|uuid|guid)
+              | serial(?:[-_\ ]?(?:number|no|num))?
+              | udid
+              | imei)
+              \s*[:=]?\s*
+              [A-Za-z0-9][A-Za-z0-9._:\-]{5,}
+            ",
+        )
+        .expect("static machine-id pattern")
+    })
+}
+
 /// Hostnames that identify a network rather than a public service.
 ///
 /// The ssh-target rule only fires when there is a `user@`, and error strings
@@ -694,13 +803,41 @@ fn private_host_re() -> &'static Regex {
     RE.get_or_init(|| {
         Regex::new(
             r"(?xi)
-              [A-Za-z0-9_\-]+(?:\.[A-Za-z0-9_\-]+)*\.(?:corp|internal|intranet|local|lan|home|priv|private|arpa)\b
-            # Four labels, and case-sensitive: hostnames are conventionally
-            # lowercase, while a capitalised label means a class name. Three
-            # labels ate `config.yml.bak` and `os.path.join`; case-insensitivity
-            # ate `java.lang.Thread.run`. A capitalised host under a private
-            # suffix is still caught by the rule above.
-            | (?-i:[a-z0-9_\-]+(?:\.[a-z0-9_\-]+){2,}\.[a-z]{2,})\b
+              # A private suffix, plus anything after it. The trailing group is
+              # what stops the rule biting off `bastion.corp` and publishing
+              # `acme-inc.com` — the interesting half of the name.
+              [A-Za-z0-9_\-]+(?:\.[A-Za-z0-9_\-]+)*
+              \.(?:corp|internal|intranet|local|lan|home|priv|private|arpa)
+              (?:\.[A-Za-z0-9_\-]+)*\b
+            # Three or more labels under a REAL suffix, and case-sensitive.
+            #
+            # The final label used to be any run of letters, which is not a
+            # discriminator at all: `django.contrib.auth.models` has exactly
+            # the shape of a hostname, and so does every Python, Java, Kotlin
+            # and JS module path. Masking them cost a Django traceback the one
+            # line that says where the bug is, and a log block scrubbed into
+            # uselessness costs the maintainer the same round trip as no log
+            # block at all.
+            #
+            # What actually separates a host from a module path is the suffix,
+            # so the list below is the discriminator. It is deliberately not
+            # exhaustive: a host on an exotic TLD leaks, which is the trade
+            # being made, and the private-suffix rule above plus the `user@host`
+            # and git-remote rules catch the shapes that carry a name in
+            # practice. `rs`, `sh`, `pl`, `md` and `so` are OMITTED on purpose
+            # — they are file extensions far more often than they are Serbia,
+            # and `webpack.config.prod.js` must survive.
+            | (?-i:
+                [a-z0-9_\-]+(?:\.[a-z0-9_\-]+){1,}\.(?:
+                  com|net|org|edu|gov|mil|int|info|biz|name|pro|coop|aero
+                | io|co|ai|dev|app|cloud|tech|xyz|online|site|store|space
+                | website|team|group|systems|solutions|digital|agency|studio
+                | design|network|email|live|life|world|news|blog|wiki
+                | eu|us|uk|de|fr|jp|cn|ru|br|in|au|ca|ch|nl|se|no|fi|dk|es
+                | it|be|at|cz|pt|gr|hu|ro|tr|ua|kr|tw|hk|sg|nz|za|mx|ar|cl
+                | ie|il|lt|lv|ee|sk|si|hr|bg|by|kz|th|vn|ph|id|my
+                )
+              )\b
             ",
         )
         .expect("static private-host pattern")
@@ -713,19 +850,32 @@ fn home_path_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
+            // Every alternative begins with a captured left delimiter, restored
+            // by the `${1}` in the replacement. See `scrub`.
             r"(?xi)
-              (?:/Users|/home)/[^\s\x22/]+(?:/[^\s\x22]*)?
-            # Root's home is still an account's home, and a path under it says
-            # the process ran privileged.
-            | /var/root\b(?:/[^\s\x22]*)?
-            | /root\b(?:/[^\s\x22]*)?
-            # macOS per-user temp: the salt uniquely identifies the user.
-            | /private/var/folders/[^\s\x22]*
-            | /var/folders/[^\s\x22]*
-            # `~alice/.bashrc` names the account without any /home prefix.
-            | ~[A-Za-z0-9._\-]+(?:/[^\s\x22]*)?
-            | [A-Z]:\\Users\\[^\\/\s\x22]+(?:\\[^\s\x22]*)?
-            | [A-Z]:\\Documents\ and\ Settings\\[^\\/\s\x22]+(?:\\[^\s\x22]*)?
+              (^|[^A-Za-z0-9_])
+              (?:
+                (?:/Users|/home)/[^\s\x22/]+(?:/[^\s\x22]*)?
+              # Root's home is still an account's home, and a path under it says
+              # the process ran privileged.
+              | /var/root\b(?:/[^\s\x22]*)?
+              | /root\b(?:/[^\s\x22]*)?
+              # macOS per-user temp: the salt uniquely identifies the user.
+              | /private/var/folders/[^\s\x22]*
+              | /var/folders/[^\s\x22]*
+              # `~alice/.bashrc` names the account without any /home prefix.
+              # The first character must be a LETTER: `HEAD~1` and `main~2` are
+              # git revisions, and with a digit allowed here every one of them
+              # in a pasted command became `<path>`.
+              | ~[A-Za-z][A-Za-z0-9._\-]*(?:/[^\s\x22]*)?
+              # A UNC path names the file server as well as the account.
+              | \\\\[A-Za-z0-9._\-]+\\[^\s\x22]*
+              # The drive letter is OPTIONAL. A stack trace prints the path
+              # relative to the profile root, and `Users\bob\...` named the
+              # account with nothing to stop it.
+              | (?:[A-Z]:)?\\?Users\\[^\\/\s\x22]+(?:\\[^\s\x22]*)?
+              | (?:[A-Z]:)?\\?Documents\ and\ Settings\\[^\\/\s\x22]+(?:\\[^\s\x22]*)?
+              )
             ",
         )
         .expect("static home-path pattern")
