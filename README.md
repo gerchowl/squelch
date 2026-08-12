@@ -100,6 +100,8 @@ This is a real bug in the wild, not a hypothetical — `bugreport` formats arbit
 
 Posting a body through an API bypasses issue-form validation entirely — `required: true` never runs. That's what the GitHub API does, not a limitation here, but it means your form is advisory on every route except `Browser`. The two routes that transmit without a built-in review surface refuse to send until you call `.confirmed()`.
 
+**`Browser` is the only route with a size limit.** A prefill URL is capped, so a long report can lose a whole section on the way into the form. `Browser` refuses rather than open a form the reporter has already approved in a preview that showed more than would arrive — showing *less* than leaves is a privacy failure, showing *more* corrupts what they believe they consented to send. `Composed::url` names what was `shortened` and what was `dropped`, so your surface can offer another route. The report itself is fine at any length; every other route carries it whole.
+
 **`Endpoint` is an open gateway unless you gate it.** A CLI can't solve a CAPTCHA, so the abuse protection a web app would use isn't available. An unauthenticated issue-creating endpoint is a spam target the moment its URL is found — and it will be found, because it ships inside your binary. Rate-limit at the edge, require a proof-of-work stamp, or use real per-user auth.
 
 ## What it will never do
