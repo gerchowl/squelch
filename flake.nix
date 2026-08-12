@@ -2,8 +2,11 @@
   description = "squelch — file a genuinely useful bug report without leaking the machine";
 
   inputs = {
-    # The Rust language pack under review: vig-os/devkit#1429.
-    devkit.url = "github:vig-os/devkit/feature/1400-rust-language-pack";
+    # The Rust language pack under review: vig-os/devkit#1429, plus the
+    # consumer fixes this repo's adoption produced (vig-os/devkit#1452, which
+    # targets the pack branch). Repoint at the pack branch once #1452 merges,
+    # and at a release tag once the pack does.
+    devkit.url = "github:vig-os/devkit/feature/1450-rust-pack-consumer-hardening";
     nixpkgs.follows = "devkit/nixpkgs";
   };
 
@@ -38,16 +41,9 @@
               };
               src = ./.;
               # squelch is mostly feature-gated: `gh-cli`, `endpoint` and
-              # `serde` add 4 tests and a good deal of code that a
-              # default-features build never compiles, so clippy would never
-              # see it. mkRustProject has no `features`/`cargoExtraArgs`
-              # argument; `buildEnv` is merged verbatim into crane's
-              # commonArgs, so it is the only reachable seam. Documented as
-              # being for CMAKE_*/PKG_CONFIG_PATH — using it this way is a
-              # workaround, reported to vig-os/devkit#1429.
-              buildEnv = {
-                cargoExtraArgs = "--all-features";
-              };
+              # `serde` add 4 tests and a good deal of code a default-features
+              # build never compiles, so clippy would never see it.
+              cargoExtraArgs = "--all-features";
               # For ./rust-toolchain.toml. Changes when the channel or the
               # component list does; the build failure prints the new one.
               toolchainHash = "sha256-mvUGEOHYJpn3ikC5hckneuGixaC+yGrkMM/liDIDgoU=";

@@ -29,16 +29,16 @@
         "treefmt-nix": "treefmt-nix"
       },
       "locked": {
-        "lastModified": 1786496498,
-        "narHash": "sha256-F69o9ZBCXjjTIX7yZuO/vI4fe4V6RyZXeDVHLT7vdZ4=",
+        "lastModified": 1786527846,
+        "narHash": "sha256-4CGYTVwzF0DRv7m3h31ASiAHNPZHm9YxtWcdRSdyQbc=",
         "owner": "vig-os",
         "repo": "devkit",
-        "rev": "f64240e4b3e5c62b75ce27937a94a5734eb756d3",
+        "rev": "4be5e00dff4204e2123c63b0c7cbc3c34e528c9b",
         "type": "github"
       },
       "original": {
         "owner": "vig-os",
-        "ref": "feature/1400-rust-language-pack",
+        "ref": "feature/1450-rust-pack-consumer-hardening",
         "repo": "devkit",
         "type": "github"
       }
@@ -49,7 +49,10 @@
           "devkit",
           "nixpkgs"
         ],
-        "rust-analyzer-src": "rust-analyzer-src"
+        "rust-analyzer-src": [
+          "devkit",
+          "nixpkgs"
+        ]
       },
       "locked": {
         "lastModified": 1786432497,
@@ -220,23 +223,6 @@
           "devkit",
           "nixpkgs"
         ]
-      }
-    },
-    "rust-analyzer-src": {
-      "flake": false,
-      "locked": {
-        "lastModified": 1786396074,
-        "narHash": "sha256-tQAL2tJNNhPV6LBY/9pef+fq37RLYts/LknqJ6m9Y6Q=",
-        "owner": "rust-lang",
-        "repo": "rust-analyzer",
-        "rev": "57bea800b866168ac4f310333e326b92ccba7aca",
-        "type": "github"
-      },
-      "original": {
-        "owner": "rust-lang",
-        "ref": "nightly",
-        "repo": "rust-analyzer",
-        "type": "github"
       }
     },
     "services-flake": {
