@@ -30,10 +30,8 @@ allow = [
   "MIT",
   "Apache-2.0",
   "Apache-2.0 WITH LLVM-exception",
-  "BSD-2-Clause",
   "BSD-3-Clause",
   "ISC",
-  "Zlib",
   "Unicode-3.0",
   # `webpki-roots` — Mozilla's CA bundle, which arrives with rustls under the
   # `endpoint` feature. A data licence rather than a code one, and permissive;
@@ -41,6 +39,9 @@ allow = [
   "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.9
+# The list is exactly what the tree uses today. cargo-deny warns on an
+# allowance nothing matched, and that warning is worth keeping true: an
+# aspirational list quietly stops describing what is actually being permitted.
 
 [bans]
 # `warn`, not `deny`: a duplicate version is usually someone else's lag, and

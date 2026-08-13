@@ -207,10 +207,17 @@ ssh <linux-host> 'cd ~/ci/squelch && nix flake check'
 **Delete `.git` on the far side, and mean it.** `--exclude '.git/'` tells rsync
 to ignore that directory on *both* ends, so `--delete` will not remove a stale
 one left by an earlier sync — and nix, finding a git repository, then builds
-from its **index** rather than from the files on disk. The result is a check
-that runs against whatever was tracked whenever that `.git` was copied, silently.
-It cost a full round here: `tests/issue_form.rs` failed on Linux and passed on
-macOS, and the difference was a `.git` three commits out of date.
+from its **index** rather than from the files on disk. The check runs against
+whatever was tracked whenever that `.git` was copied, and says nothing about
+what you just wrote.
+
+**A fixture read at run time is not a fixture.** `std::fs` plus
+`CARGO_MANIFEST_DIR` looks equivalent to `include_str!` and is not: it needs the
+source tree to still be where it was when the binary was built, which under
+`nix flake check` it is not. `tests/issue_form.rs` failed on Linux and passed on
+macOS for exactly this reason, and the failure read as a broken test rather than
+as an environment difference. `include_str!` also makes a missing fixture a
+*compile* error, so a test cannot quietly stop asserting anything.
 
 `nix flake check | tail` is the same class of mistake in one line: the pipe
 reports `tail`'s exit status, so a failing check reads as a passing one. Redirect
