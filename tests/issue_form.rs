@@ -12,11 +12,47 @@
 //! checks the URL squelch *built* rather than the template it points at.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-}
+/// The files are baked in at COMPILE time, not read at run time.
+///
+/// `std::fs` plus `CARGO_MANIFEST_DIR` looks equivalent and is not: it depends
+/// on the source tree still being where it was when the binary was built. Under
+/// `nix flake check` it is not, and the whole suite failed with "No such file
+/// or directory" on Linux while passing locally — which reads as a broken test
+/// rather than as the environment difference it is.
+///
+/// `include_str!` also makes a missing file a **compile** error, so this test
+/// cannot quietly stop asserting anything.
+const FORM: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/.github/ISSUE_TEMPLATE/bug.yml"
+));
+
+/// The files that teach a reader — or a consumer — which ids to use.
+const SURFACES: [(&str, &str); 4] = [
+    (
+        "src/lib.rs",
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs")),
+    ),
+    (
+        "README.md",
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md")),
+    ),
+    (
+        "examples/file_a_bug.rs",
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/examples/file_a_bug.rs"
+        )),
+    ),
+    (
+        "apps/squelch-demo/src/main.rs",
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/apps/squelch-demo/src/main.rs"
+        )),
+    ),
+];
 
 /// Field ids declared by the checked-in issue form.
 ///
@@ -58,41 +94,28 @@ fn prefilled_ids(source: &str) -> BTreeSet<String> {
     ids
 }
 
-/// The files that teach a reader — or a consumer — which ids to use.
-const SURFACES: [&str; 4] = [
-    "src/lib.rs",
-    "README.md",
-    "examples/file_a_bug.rs",
-    "apps/squelch-demo/src/main.rs",
-];
-
-fn read(path: &Path) -> String {
-    std::fs::read_to_string(path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()))
-}
-
 #[test]
 fn the_repo_ships_the_template_its_own_links_point_at() {
-    let form = repo_root().join(".github/ISSUE_TEMPLATE/bug.yml");
+    // Its absence is a compile error — see `FORM`. What is still worth
+    // asserting is that it is not empty, which `include_str!` would accept.
     assert!(
-        form.exists(),
+        !FORM.trim().is_empty(),
         "every example in this repo builds `template(\"bug.yml\")` against \
-         gerchowl/squelch, so {} has to exist or those links open a form with \
-         no fields to land in",
-        form.display()
+         gerchowl/squelch, so the form has to have fields for those links to \
+         land in"
     );
 }
 
 #[test]
 fn every_id_the_repo_prefills_is_declared_by_the_template() {
-    let root = repo_root();
-    let declared = declared_ids(&read(&root.join(".github/ISSUE_TEMPLATE/bug.yml")));
+    let declared = declared_ids(FORM);
     assert!(
         !declared.is_empty(),
         "no ids parsed out of the issue form — the scan is vacuous, not passing"
     );
 
-    for surface in SURFACES {
-        let used = prefilled_ids(&read(&root.join(surface)));
+    for (surface, source) in SURFACES {
+        let used = prefilled_ids(source);
         assert!(
             !used.is_empty(),
             "{surface} named no field ids; the scanner has drifted from the \
@@ -114,7 +137,7 @@ fn the_default_provenance_field_is_declared() {
     // `Report` writes the environment block into `environment` unless told
     // otherwise, and that default is invisible at the call site — nothing in
     // the examples mentions it, so nothing else would catch its absence.
-    let declared = declared_ids(&read(&repo_root().join(".github/ISSUE_TEMPLATE/bug.yml")));
+    let declared = declared_ids(FORM);
     assert!(
         declared.contains("environment"),
         "`Report::provenance_field` defaults to `environment`; the template \
@@ -136,9 +159,8 @@ fn the_default_provenance_field_is_declared() {
 fn the_crate_parses_its_own_issue_form() {
     use squelch::form::github::IssueForm;
 
-    let yaml = read(&repo_root().join(".github/ISSUE_TEMPLATE/bug.yml"));
     let parsed: IssueForm =
-        serde_yaml_ng::from_str(&yaml).expect("squelch parses a real GitHub issue form");
+        serde_yaml_ng::from_str(FORM).expect("squelch parses a real GitHub issue form");
     let form: squelch::Form = parsed.into();
 
     // The line scan and the real parser must agree about which fields can hold
@@ -149,7 +171,7 @@ fn the_crate_parses_its_own_issue_form() {
     // synthesises `field-<n>` so a surface still has a key. The `markdown`
     // intro block in this template has no id and gets one, which the line scan
     // cannot see and should not — it carries no answer.
-    let scanned = declared_ids(&yaml);
+    let scanned = declared_ids(FORM);
     let answerable: BTreeSet<String> = form
         .fields
         .iter()
@@ -184,8 +206,7 @@ fn the_confirmation_is_a_checkbox_no_url_can_reach() {
     // asks for the attestation as `checkboxes`. As a `dropdown` or `input` it
     // becomes prefillable, and the refusal quietly stops being enforced by
     // anything.
-    let form = read(&repo_root().join(".github/ISSUE_TEMPLATE/bug.yml"));
-    let confirm = form
+    let confirm = FORM
         .split("- type: ")
         .find(|block| block.contains("id: confirm"))
         .expect("the form declares a `confirm` field");
