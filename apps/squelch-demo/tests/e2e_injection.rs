@@ -33,7 +33,7 @@ fn assert_fence_intact(what: &str, body: &str) {
     );
 }
 
-/// Everything outside a ```-fence. Inside one, markup is literal and inert —
+/// Everything outside a fenced block. Inside one, markup is literal and inert —
 /// the property that matters there is fence integrity, which
 /// [`assert_fence_intact`] covers. Demanding escaped HTML inside the fence too
 /// would be over-masking: the block has to stay readable to a triager.

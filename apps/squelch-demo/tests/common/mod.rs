@@ -10,7 +10,7 @@
 //!
 //! So each fake receiver captures the real payload and the tests assert on
 //! that: the URL `open` was handed, the argv `gh` was called with, the bytes
-//! POSTed to the endpoint.
+//! `POST`ed to the endpoint.
 //!
 //! # No new dependencies
 //!
