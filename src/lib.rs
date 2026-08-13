@@ -105,7 +105,18 @@
 //! paths it exists to mask. It still redacts, builds URLs and renders bodies.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
-#![warn(missing_debug_implementations)]
+// The panic-path lints, on the library only. A panic in a bug reporter fires
+// exactly when the application is already failing, so the reporter's last
+// impression of the tool is it crashing a second time on the way to the
+// complaint form.
+//
+// Excluded under `cfg(test)` rather than left off: a test SHOULD unwrap, that
+// is how it reports a failure, and leaving them on would bury the handful of
+// real hits under a hundred correct ones. The lint policy shared by the whole
+// workspace lives in `Cargo.toml`; these two are here because that table has
+// no way to say "not in tests".
+#![warn(clippy::unwrap_used, clippy::indexing_slicing)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::indexing_slicing))]
 
 pub mod destination;
 pub mod error;

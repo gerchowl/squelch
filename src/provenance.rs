@@ -18,6 +18,7 @@ use std::fmt::Write as _;
 /// A single collected fact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Value {
+    /// Found, with the value.
     Known(String),
     /// Looked for, definitively not present.
     NotSet,
@@ -26,6 +27,8 @@ pub enum Value {
 }
 
 impl Value {
+    /// Read an environment variable, distinguishing "empty or absent" from
+    /// "the lookup itself failed".
     pub fn from_env(name: &str) -> Self {
         match std::env::var(name) {
             Ok(value) if !value.is_empty() => Self::Known(value),
@@ -34,10 +37,13 @@ impl Value {
         }
     }
 
+    /// A fact the caller already has in hand.
     pub fn known(value: impl Into<String>) -> Self {
         Self::Known(value.into())
     }
 
+    /// The value, or the placeholder that stands in for it. Never empty, so a
+    /// rendered environment block has no blank rows.
     pub fn as_str(&self) -> &str {
         match self {
             Self::Known(value) => value,
@@ -62,6 +68,7 @@ pub struct Provenance {
 }
 
 impl Provenance {
+    /// An empty block. [`Provenance::standard`] is the one that collects.
     pub fn new() -> Self {
         Self::default()
     }
@@ -157,6 +164,7 @@ impl Provenance {
         self.with(label, value)
     }
 
+    /// The collected facts, in the order they were added.
     pub fn entries(&self) -> &[(String, Value)] {
         &self.entries
     }

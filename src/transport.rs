@@ -69,7 +69,12 @@ pub enum Transport {
     /// squelch and POST with the platform's own fetch — the composed body and
     /// destination are both public on [`crate::Composed`].
     #[cfg(feature = "endpoint")]
-    Endpoint { url: String, auth: Auth },
+    Endpoint {
+        /// Where to POST.
+        url: String,
+        /// How to authenticate, if at all.
+        auth: Auth,
+    },
 
     /// Create the issue with the `gh` CLI, using the reporter's own credentials.
     ///
@@ -123,10 +128,17 @@ pub type DynamicAuth = std::sync::Arc<dyn Fn() -> Result<Vec<(String, String)>> 
 /// endpoint. Both are supplied by the embedding application at runtime.
 #[cfg(feature = "endpoint")]
 pub enum Auth {
+    /// Send nothing. Read the abuse warning on [`Transport::Endpoint`] first:
+    /// an unauthenticated issue-creating endpoint is a spam target the moment
+    /// its URL is found, and it ships inside your binary.
     None,
+    /// `Authorization: Bearer <token>`.
     Bearer(String),
+    /// An arbitrary header, for schemes that are not bearer tokens.
     Header {
+        /// The header name.
         name: String,
+        /// Its value.
         value: String,
     },
     /// Computed per request, for short-lived tokens the crate must not cache.

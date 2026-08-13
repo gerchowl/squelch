@@ -15,6 +15,7 @@ pub struct Destination {
     name: String,
 }
 
+/// Why a [`Destination`] could not be determined, or was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DestinationError {
     /// The crate declares no `repository` and none was supplied.
@@ -56,14 +57,17 @@ impl Destination {
         }
     }
 
+    /// The account or organisation the repository belongs to.
     pub fn owner(&self) -> &str {
         &self.owner
     }
 
+    /// The repository name.
     pub fn name(&self) -> &str {
         &self.name
     }
 
+    /// `owner/name`, as GitHub writes it.
     pub fn slug(&self) -> String {
         format!("{}/{}", self.owner, self.name)
     }

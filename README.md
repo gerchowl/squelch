@@ -153,9 +153,21 @@ cargo run --example file_a_bug
 
 Composes a full report, prints the preview, and shows what the redactor kept and dropped. Nothing is sent.
 
+## What CI actually checks
+
+`nix flake check` runs the same nine checks on aarch64-darwin and x86_64-linux: fmt, clippy with warnings denied, nextest, doctests, rustdoc, the crate build, `cargo deny` over advisories/licences/bans/sources, a feature powerset, and an MSRV build.
+
+Three of those are here because something got through without them:
+
+- **The feature powerset** compiles every combination with `--no-dev-deps`. `endpoint` used `serde_json::json!` without depending on serde_json, so the crate did not build for anyone using `default-features = false, features = ["endpoint"]` — while every check stayed green, because `--all-features` supplies what it was missing and the dev-dependency masks it for anything built with tests.
+- **The MSRV check** builds with exactly the compiler `rust-version` names. It was `1.74`, verified by nothing, and 1.74 could not build this crate at all. A declared-but-unverified MSRV is a *false* promise rather than a weak one: the failure lands on a downstream with no way to tell it from their own mistake.
+- **`tests/issue_form.rs`** asserts that the field ids this repo's own examples prefill are declared by the issue form this repo ships — and runs that form through the crate's own GitHub parser. GitHub drops a query parameter naming no field silently, after the reporter has approved the preview.
+
 ## Status
 
-Early. The redaction rules have been exercised against a real ~10k-line production log corpus and an adversarial review pass, but the API may still shift before 1.0. If you find a leak, that's the bug worth reporting.
+Early. The redaction rules have been exercised against a real ~10k-line production log corpus and three adversarial review passes, but the API may still shift before 1.0. If you find a leak, that's the bug worth reporting.
+
+Two gaps in the scrubber are decisions rather than oversights, and are written down at the rules themselves: **encoded secrets** (a base64 or `\u`-escaped token matches nothing — the labelled-secret rule catches the JSON error bodies that carry them in practice) and **hosts on suffixes outside the list** the FQDN rule tests against, which exists because without it the rule cannot tell `bastion.corp.acme.com` from `django.contrib.auth.models`.
 
 ## License
 

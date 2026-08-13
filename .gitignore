@@ -3,3 +3,7 @@
 # nix build outputs
 /result
 /result-*
+
+# proptest writes a regression file next to the test when a property fails.
+# Committed deliberately when it contains a real counterexample; ignored while
+# empty so a transient local failure does not become a diff.

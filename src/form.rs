@@ -44,13 +44,19 @@ pub enum FieldKind {
     /// Many lines.
     Textarea,
     /// One of a fixed set.
-    Dropdown { options: Vec<String> },
+    Dropdown {
+        /// The choices offered.
+        options: Vec<String>,
+    },
     /// Zero or more of a fixed set.
     ///
     /// Cannot be prefilled from a GitHub URL, and should not be filled
     /// programmatically anyway: a "yes, I confirm" box is an attestation, and
     /// a tool that ticks it forges a human's statement.
-    Checkboxes { options: Vec<String> },
+    Checkboxes {
+        /// The boxes offered.
+        options: Vec<String>,
+    },
     /// Static text shown to the reporter. Carries no answer.
     Markdown,
 }
@@ -82,8 +88,10 @@ pub struct Field {
         serde(default, skip_serializing_if = "Option::is_none")
     )]
     pub description: Option<String>,
+    /// Whether a report is incomplete without an answer here.
     #[cfg_attr(feature = "serde", serde(default))]
     pub required: bool,
+    /// How a surface should present it.
     pub kind: FieldKind,
     /// This field is filled by the application, not the reporter — an
     /// environment block, for instance. Surfaces should not prompt for it.
@@ -92,6 +100,8 @@ pub struct Field {
 }
 
 impl Field {
+    /// A field of any kind. The `textarea` and `input` shortcuts below cover
+    /// the two a URL can prefill.
     pub fn new(id: impl Into<String>, label: impl Into<String>, kind: FieldKind) -> Self {
         Self {
             id: id.into(),
@@ -103,24 +113,30 @@ impl Field {
         }
     }
 
+    /// A multi-line field.
     pub fn textarea(id: impl Into<String>, label: impl Into<String>) -> Self {
         Self::new(id, label, FieldKind::Textarea)
     }
 
+    /// A single-line field.
     pub fn input(id: impl Into<String>, label: impl Into<String>) -> Self {
         Self::new(id, label, FieldKind::Input)
     }
 
+    /// Mark this field as one a report cannot be submitted without.
     pub fn required(mut self) -> Self {
         self.required = true;
         self
     }
 
+    /// Mark this field as supplied by the application, so no surface prompts
+    /// a human for it.
     pub fn machine_filled(mut self) -> Self {
         self.machine_filled = true;
         self
     }
 
+    /// Attach the help text shown under the label.
     pub fn describe(mut self, description: impl Into<String>) -> Self {
         self.description = Some(description.into());
         self
@@ -144,10 +160,12 @@ pub struct Form {
         serde(default, skip_serializing_if = "Option::is_none")
     )]
     pub title_prefix: Option<String>,
+    /// The fields, in the order a surface should present them.
     pub fields: Vec<Field>,
 }
 
 impl Form {
+    /// A form from its fields. Add the template name with [`Form::template`].
     pub fn new(fields: impl IntoIterator<Item = Field>) -> Self {
         Self {
             template: None,
@@ -156,11 +174,14 @@ impl Form {
         }
     }
 
+    /// Name the issue-form file this describes, e.g. `bug.yml`. Without it a
+    /// browser route has no form to open.
     pub fn template(mut self, template: impl Into<String>) -> Self {
         self.template = Some(template.into());
         self
     }
 
+    /// Look a field up by its id.
     pub fn field(&self, id: &str) -> Option<&Field> {
         self.fields.iter().find(|field| field.id == id)
     }
@@ -210,22 +231,28 @@ impl Form {
                 FieldKind::Markdown => continue,
                 FieldKind::Checkboxes { .. } => {
                     out.push_str(&format!(
-                        "\n<!-- \"{}\" is confirmed by you, not by this tool. -->\n",
+                        "\n<!-- squelch: \"{}\" is confirmed by you, not by this tool. -->\n",
                         guidance(&field.label)
                     ));
                 }
                 _ if field.machine_filled => {
                     out.push_str(&format!(
-                        "\n<!-- \"{}\" is filled in automatically. -->\n",
+                        "\n<!-- squelch: \"{}\" is filled in automatically. -->\n",
                         guidance(&field.label)
                     ));
                 }
                 _ => {
                     out.push_str(&format!("\n## {}\n", field.id));
+                    // Every guidance comment is marked. `parse_skeleton`
+                    // stripped any line beginning `<!--`, which is a shape a
+                    // reporter writes too — an HTML comment in an answer was
+                    // deleted on the way back, and nothing said so. The parser
+                    // cannot tell its own guidance from the reporter's prose
+                    // unless the guidance says which it is.
                     if let Some(description) = &field.description {
-                        out.push_str(&format!("<!-- {} -->\n", guidance(description)));
+                        out.push_str(&format!("<!-- squelch: {} -->\n", guidance(description)));
                     } else {
-                        out.push_str(&format!("<!-- {} -->\n", guidance(&field.label)));
+                        out.push_str(&format!("<!-- squelch: {} -->\n", guidance(&field.label)));
                     }
                     out.push('\n');
                 }
@@ -239,7 +266,16 @@ impl Form {
     /// Headings inside a fenced code block are content, not structure —
     /// reproduction steps routinely paste shell transcripts, and treating a
     /// `##` inside a fence as a new section silently truncates the report.
-    pub fn parse_skeleton(text: &str) -> Vec<(String, String)> {
+    ///
+    /// A method rather than an associated function, because **only this form
+    /// knows which headings are its own**. `## <anything>` was a section
+    /// delimiter, so a reporter who wrote an ordinary markdown heading into an
+    /// answer — outside any fence, which is where prose lives — had the rest
+    /// of their answer filed under a section that does not exist, and the
+    /// section they were answering came back empty. Nothing reported it. A
+    /// heading naming an id this form does not declare is now content, which
+    /// is the only reading that can tell the two apart.
+    pub fn parse_skeleton(&self, text: &str) -> Vec<(String, String)> {
         let mut out: Vec<(String, String)> = Vec::new();
         let mut current: Option<String> = None;
         // Which marker opened the current fence, so a ``` block is closed by
@@ -270,10 +306,16 @@ impl Form {
                 }
             } else if fence.is_none() && !indented {
                 if let Some(heading) = trimmed.strip_prefix("## ") {
-                    current = Some(heading.trim().to_string());
-                    continue;
+                    let heading = heading.trim();
+                    if self.fields.iter().any(|field| field.id == heading) {
+                        current = Some(heading.to_string());
+                        continue;
+                    }
+                    // Not one of ours. Fall through and keep it as content of
+                    // whichever section we are in.
                 }
-                if trimmed.starts_with("<!--") {
+                // Only OUR guidance. See `skeleton`.
+                if trimmed.starts_with("<!-- squelch:") {
                     continue;
                 }
             }
@@ -340,6 +382,13 @@ impl Form {
 /// GitHub's issue-form schema, for consumers who keep their form in
 /// `.github/ISSUE_TEMPLATE/`.
 ///
+/// These types mirror GitHub's schema field for field, and their doc comments
+/// say what GitHub means by each key rather than what squelch does with it. The
+/// `From<IssueForm> for Form` conversion at the bottom of the module is the one
+/// place the two vocabularies meet.
+///
+/// Only compiled with the `serde` feature.
+///
 /// These mirror [GitHub's documented syntax][syntax] rather than any particular
 /// project's template, so they cannot drift from a file we do not control.
 /// Bring your own deserializer:
@@ -358,85 +407,140 @@ impl Form {
 pub mod github {
     use super::{Field, FieldKind, Form};
 
+    /// A whole `.github/ISSUE_TEMPLATE/*.yml` file.
     #[derive(Debug, Clone, serde::Deserialize)]
     pub struct IssueForm {
+        /// The template's name in GitHub's chooser.
         pub name: Option<String>,
+        /// The one-line blurb under that name in the chooser.
         pub description: Option<String>,
         /// A title prefix, e.g. `[bug] `.
         pub title: Option<String>,
+        /// The elements, in the order the reporter meets them.
         pub body: Vec<Element>,
     }
 
+    /// One entry in a form's `body`.
+    ///
+    /// `id` is optional throughout, because GitHub only requires it for
+    /// elements that carry an answer — and permits omitting it even there.
+    /// [`Form`] synthesises one when it is missing, since a surface needs a key
+    /// to render against; such a field cannot be prefilled from a URL.
     #[derive(Debug, Clone, serde::Deserialize)]
     #[serde(tag = "type", rename_all = "lowercase")]
     pub enum Element {
+        /// Static text shown to the reporter. Carries no answer.
         Markdown {
+            /// GitHub's field id, if the template gave one.
             #[serde(default)]
             id: Option<String>,
+            /// The text itself.
             attributes: MarkdownAttributes,
         },
+        /// A single-line answer.
         Input {
+            /// GitHub's field id, and the URL query parameter that prefills it.
             id: Option<String>,
+            /// Label and help text.
             attributes: InputAttributes,
+            /// Whether GitHub's own form validation demands an answer.
             #[serde(default)]
             validations: Validations,
         },
+        /// A multi-line answer.
         Textarea {
+            /// GitHub's field id, and the URL query parameter that prefills it.
             id: Option<String>,
+            /// Label and help text.
             attributes: InputAttributes,
+            /// Whether GitHub's own form validation demands an answer.
             #[serde(default)]
             validations: Validations,
         },
+        /// One choice from a fixed set.
         Dropdown {
+            /// GitHub's field id, and the URL query parameter that prefills it.
             id: Option<String>,
+            /// Label, help text and the offered options.
             attributes: ChoiceAttributes,
+            /// Whether GitHub's own form validation demands an answer.
             #[serde(default)]
             validations: Validations,
         },
+        /// Zero or more choices from a fixed set.
+        ///
+        /// Cannot be prefilled from a URL at all, which is the outcome squelch
+        /// wants: a "yes, this is reproducible" box is an attestation, and a
+        /// tool that ticks it forges a human's statement.
         Checkboxes {
+            /// GitHub's field id.
             id: Option<String>,
+            /// Label, help text and the offered options.
             attributes: CheckboxAttributes,
+            /// Whether GitHub's own form validation demands an answer.
             #[serde(default)]
             validations: Validations,
         },
     }
 
+    /// The body of a `markdown` element.
     #[derive(Debug, Clone, serde::Deserialize)]
     pub struct MarkdownAttributes {
+        /// The markdown shown to the reporter.
         pub value: String,
     }
 
+    /// Presentation for an `input` or `textarea`.
     #[derive(Debug, Clone, serde::Deserialize)]
     pub struct InputAttributes {
+        /// Rendered above the answer, and emitted as `### <label>` in a
+        /// submitted issue body.
         pub label: String,
+        /// Help text under the label.
         pub description: Option<String>,
     }
 
+    /// Presentation for a `dropdown`, which offers plain strings.
     #[derive(Debug, Clone, serde::Deserialize)]
     pub struct ChoiceAttributes {
+        /// Rendered above the answer.
         pub label: String,
+        /// Help text under the label.
         pub description: Option<String>,
+        /// The choices offered.
         #[serde(default)]
         pub options: Vec<String>,
     }
 
+    /// Presentation for a `checkboxes` element, whose options are structured.
     #[derive(Debug, Clone, serde::Deserialize)]
     pub struct CheckboxAttributes {
+        /// Rendered above the boxes.
         pub label: String,
+        /// Help text under the label.
         pub description: Option<String>,
+        /// The boxes offered.
         #[serde(default)]
         pub options: Vec<CheckboxOption>,
     }
 
+    /// One box in a `checkboxes` element.
     #[derive(Debug, Clone, serde::Deserialize)]
     pub struct CheckboxOption {
+        /// The text beside the box.
         pub label: String,
+        /// Whether the reporter must tick this particular box to submit.
         #[serde(default)]
         pub required: bool,
     }
 
+    /// GitHub's own submit-time validation for one element.
     #[derive(Debug, Clone, Default, serde::Deserialize)]
     pub struct Validations {
+        /// Whether GitHub refuses the submission while this is empty.
+        ///
+        /// This is the only route on which a form is enforced rather than
+        /// advisory — an API POST bypasses it entirely.
         #[serde(default)]
         pub required: bool,
     }
@@ -587,10 +691,10 @@ mod tests {
     #[test]
     fn skeleton_round_trips() {
         let filled = form().skeleton().replace(
-            "## current-behavior\n<!-- Current behavior -->\n",
+            "## current-behavior\n<!-- squelch: Current behavior -->\n",
             "## current-behavior\nit crashes\n",
         );
-        let parsed = Form::parse_skeleton(&filled);
+        let parsed = form().parse_skeleton(&filled);
         assert_eq!(
             parsed
                 .iter()
@@ -610,7 +714,7 @@ mod tests {
 
     #[test]
     fn headings_inside_a_fence_are_content() {
-        let parsed = Form::parse_skeleton(
+        let parsed = form().parse_skeleton(
             "## reproduction\nRun:\n```sh\n## install\nmake test\n```\nThen it dies.\n",
         );
         let repro = &parsed
@@ -676,7 +780,7 @@ mod tests {
         // A shell transcript containing `~~~` closed the ``` block early, and
         // the next `##` then split the reporter's content across sections it
         // never belonged to.
-        let parsed = Form::parse_skeleton(
+        let parsed = form().parse_skeleton(
             "## reproduction\nRun:\n```sh\n~~~\n## not a heading\n```\nThen it dies.\n",
         );
         let repro = &parsed
@@ -693,7 +797,7 @@ mod tests {
     fn an_indented_heading_is_code_not_structure() {
         // Four spaces is a code block in CommonMark. Treating the `##` there as
         // a heading invented a section and silently emptied the real one.
-        let parsed = Form::parse_skeleton("## reproduction\n    ## indented\nreal content\n");
+        let parsed = form().parse_skeleton("## reproduction\n    ## indented\nreal content\n");
         assert!(
             parsed.iter().any(|(id, _)| id == "reproduction"),
             "the real section was emptied: {parsed:?}"
@@ -724,7 +828,7 @@ mod tests {
 
         // And the reporter's own answer is unaffected by it.
         let filled = skeleton.replace("## repro\n", "## repro\nit crashes\n");
-        let parsed = Form::parse_skeleton(&filled);
+        let parsed = form.parse_skeleton(&filled);
         assert_eq!(
             parsed
                 .iter()

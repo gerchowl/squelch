@@ -2,8 +2,14 @@
 
 use std::fmt;
 
+/// This crate's `Result`, with [`Error`] already applied.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Everything that can go wrong composing or sending a report.
+///
+/// Every variant's `Display` is written for the *reporter* rather than the
+/// developer: it is shown to a person who is already having a bad day with
+/// your software, and it says what they can do next.
 #[derive(Debug)]
 pub enum Error {
     /// No destination could be determined.
@@ -15,18 +21,26 @@ pub enum Error {
     /// A route that sends without a review surface was used without
     /// [`crate::Report::confirmed`].
     ConfirmationRequired(String),
+    /// An external program could not be started.
     Spawn {
+        /// The program that could not be run, e.g. `gh`.
         program: String,
+        /// What the operating system said.
         source: std::io::Error,
     },
+    /// The platform's URL opener ran and reported failure.
     OpenerFailed(String),
     /// The prefilled URL could not carry these fields, so opening the form
     /// would submit a report missing whole sections.
     FieldsDropped(Vec<String>),
+    /// Reading or writing failed — the `File` route, mostly.
     Io(std::io::Error),
+    /// The endpoint you operate refused the report.
     #[cfg(feature = "endpoint")]
     Endpoint {
+        /// The HTTP status, when the request got far enough to have one.
         status: Option<u16>,
+        /// What the server said, or what went wrong before it could answer.
         message: String,
     },
     /// Raised by an `Auth::Dynamic` callback (`endpoint` feature). Not an

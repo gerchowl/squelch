@@ -1,0 +1,17 @@
+# The MSRV `Cargo.toml` declares, as an actual compiler.
+#
+# `rust-version` is a promise about this crate's API surface: a consumer pinned
+# there must be able to build it. Nothing verified that, so it was a *false*
+# promise rather than a weak one — the suite stayed green while a downstream
+# pinned lower would have failed, and the failure lands on them with no way to
+# tell it from their own mistake.
+#
+# Deliberately separate from the development toolchain in
+# `../rust-toolchain.toml`. Developing on the MSRV is miserable and drags the
+# whole repo backwards; testing on it is the part that matters.
+#
+# Raising this is a breaking change for consumers. Read the note beside
+# `rust-version` in Cargo.toml before touching it.
+[toolchain]
+channel = "1.86.0"
+components = ["rust-src"]

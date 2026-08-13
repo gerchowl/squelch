@@ -32,8 +32,34 @@
               inherit system;
               overlays = [ devkit.overlays.default ];
             };
+            # The same project at the MSRV `Cargo.toml` declares, for one
+            # question only: does it still compile there?
+            #
+            # Every check is off but the build. Running clippy or the test suite
+            # on a two-year-old compiler measures the compiler, not the crate —
+            # lints move, and a lint that did not exist in 1.74 failing here
+            # would say nothing about whether a consumer pinned there can use
+            # this. Compiling is the whole promise `rust-version` makes.
+            msrv = devkit.lib.mkRustProject {
+              inherit pkgs;
+              src = ./.;
+              # `-p squelch`, default features, and NOT the workspace: the
+              # MSRV is a promise about the PUBLISHED crate, and the demo app
+              # is not published. `--all-features` is wrong here for a reason
+              # worth writing down — see the `endpoint` note in README.
+              cargoExtraArgs = "-p squelch --all-features";
+              toolchainFile = ./.msrv/rust-toolchain.toml;
+              toolchainHash = "sha256-X/4ZBHO3iW0fOenQ3foEvscgAPJYl2abspaBThDOukI=";
+              clippy = false;
+              fmt = false;
+              nextest = false;
+              doc = false;
+              doctest = false;
+              deny = false;
+              auditable = false;
+            };
           in
-          f pkgs (
+          f pkgs msrv (
             devkit.lib.mkRustProject {
               # devkit.overlays.default is NOT optional: mkProjectShell pulls
               # nix/devtools.nix, which references `vig-utils` from pkgs. A
@@ -71,13 +97,21 @@
         );
     in
     {
-      devShells = forEachSystem (_: rust: { default = rust.devShell; });
-      packages = forEachSystem (_: rust: rust.packages);
+      devShells = forEachSystem (_: _: rust: { default = rust.devShell; });
+      packages = forEachSystem (_: _: rust: rust.packages);
 
       checks = forEachSystem (
-        pkgs: rust:
+        pkgs: msrv: rust:
         rust.checks
         // {
+          # `rust-version = "1.74"` is a promise about this crate's API surface,
+          # and it was verified by nothing: the suite stayed green while a
+          # consumer pinned there would have failed to build. A declared but
+          # unverified MSRV is a FALSE promise, not a weak one — the failure
+          # lands on the downstream, who has no way to tell it from their own
+          # mistake. Either this check passes or the declaration comes out of
+          # Cargo.toml.
+          msrv = msrv.checks.workspace;
           # Every feature combination must COMPILE — the pack's checks all run
           # with one feature set, and `--all-features` is the set least likely
           # to break. It hid a real one: `endpoint` uses `serde_json::json!`

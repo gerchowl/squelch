@@ -113,7 +113,12 @@ const MAX_VALUE_CHARS: usize = 1_024;
 /// One log record reduced to what may be published.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Record {
+    /// When the line was emitted, scrubbed. Always extracted, because a log
+    /// line without one is not a log line — see the allowlist note in the
+    /// module docs.
     pub timestamp: String,
+    /// The severity the emitter gave it, scrubbed. Defaults to `INFO` when the
+    /// line carried none.
     pub level: String,
     /// Which file or stream this came from, when the caller tagged it.
     pub source: Option<String>,
@@ -340,7 +345,7 @@ impl Redactor {
             let bounded = Regex::new(&format!(r"{}(?:/|\b)", regex::escape(home)))
                 .expect("escaped home pattern");
             out = bounded
-                .replace_all(&out, |caps: &regex::Captures| {
+                .replace_all(&out, |caps: &regex::Captures<'_>| {
                     if caps[0].ends_with('/') {
                         "~/".to_string()
                     } else {
@@ -556,6 +561,10 @@ fn passwd_name() -> Option<String> {
     passwd_field(|entry| entry.pw_name)
 }
 
+/// The one `unsafe` block in the crate, which is why the workspace policy sets
+/// `unsafe_code = "deny"` rather than `forbid`: banned everywhere, allowed here,
+/// with the argument written down beside it.
+#[allow(unsafe_code)]
 #[cfg(unix)]
 fn passwd_field(select: fn(&libc::passwd) -> *mut libc::c_char) -> Option<String> {
     // SAFETY: getpwuid returns a pointer into a static buffer owned by libc, or

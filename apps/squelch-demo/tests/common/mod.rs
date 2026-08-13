@@ -19,7 +19,12 @@
 //! `nix flake check`, whose sandbox has loopback but no network and no
 //! container runtime.
 
-#![allow(dead_code)] // each test binary uses a different subset
+#![allow(dead_code)]
+// each test binary uses a different subset
+// `mod common;` is compiled separately into every test binary, so from any one
+// of them these items look unreachable. They are not: they are the shared
+// fixture surface, and the alternative is copying it per binary.
+#![allow(unreachable_pub)]
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
