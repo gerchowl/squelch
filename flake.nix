@@ -32,17 +32,32 @@
               inherit system;
               overlays = [ devkit.overlays.default ];
             };
+            # Shared by BOTH mkRustProject calls below, which is the point of
+            # naming it: crane's source filter walks the crate directories for
+            # cargo sources, so neither of these reaches a sandbox on its own,
+            # and `tests/issue_form.rs` `include_str!`s both. Passing them to
+            # one project and not the other is exactly the drift that broke the
+            # x86_64-linux run — the MSRV project has its own `cleanSrc`, and
+            # it also runs the test suite.
+            extraSrcFiles = [
+              ".github/ISSUE_TEMPLATE/bug.yml"
+              "README.md"
+            ];
             # The same project at the MSRV `Cargo.toml` declares, for one
             # question only: does it still compile there?
             #
-            # Every check is off but the build. Running clippy or the test suite
-            # on a two-year-old compiler measures the compiler, not the crate —
-            # lints move, and a lint that did not exist in 1.74 failing here
-            # would say nothing about whether a consumer pinned there can use
-            # this. Compiling is the whole promise `rust-version` makes.
+            # Clippy, rustdoc, cargo-deny and nextest are all off: running them
+            # on an old compiler measures the compiler, not the crate — lints
+            # move, and a lint that did not exist yet failing here would say
+            # nothing about whether a consumer pinned there can use this.
+            #
+            # crane's `buildPackage` still runs `cargo test` in its check phase,
+            # so the suite does execute at the MSRV. That is worth having and is
+            # why this project needs the same `extraSrcFiles` as the main one.
             msrv = devkit.lib.mkRustProject {
               inherit pkgs;
               src = ./.;
+              inherit extraSrcFiles;
               # `-p squelch` and NOT `--workspace`: the MSRV is a promise
               # about the PUBLISHED crate, and the demo app is not published.
               #
@@ -81,16 +96,7 @@
               # the check still reports success — nextest said "59 tests across
               # 1 binary" while thirteen e2e tests sat there unrun.
               cargoExtraArgs = "--all-features --workspace";
-              # crane's source filter walks the crate directories for cargo
-              # sources, so neither of these reaches the sandbox on its own —
-              # and `tests/issue_form.rs` asserts they agree with each other.
-              # Without them the test does not fail, it panics on a missing
-              # file, which reads as a broken test rather than the drift it is
-              # actually there to catch.
-              extraSrcFiles = [
-                ".github/ISSUE_TEMPLATE/bug.yml"
-                "README.md"
-              ];
+              inherit extraSrcFiles;
               # For ./rust-toolchain.toml. Changes when the channel or the
               # component list does; the build failure prints the new one.
               toolchainHash = "sha256-mvUGEOHYJpn3ikC5hckneuGixaC+yGrkMM/liDIDgoU=";

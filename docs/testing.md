@@ -211,6 +211,14 @@ from its **index** rather than from the files on disk. The check runs against
 whatever was tracked whenever that `.git` was copied, and says nothing about
 what you just wrote.
 
+**A second `mkRustProject` call is a second source filter.** The MSRV check is
+its own project, with its own `cleanSrc` — so `extraSrcFiles` passed to the main
+one does not reach it, and crane's `buildPackage` runs `cargo test` in its check
+phase regardless of `nextest = false`. The result was a suite that compiled
+locally and failed to compile in the sandbox, on a file the *other* project had
+been told about. Both calls now `inherit extraSrcFiles` from one binding, which
+is the only version of this that cannot drift.
+
 **A fixture read at run time is not a fixture.** `std::fs` plus
 `CARGO_MANIFEST_DIR` looks equivalent to `include_str!` and is not: it needs the
 source tree to still be where it was when the binary was built, which under
