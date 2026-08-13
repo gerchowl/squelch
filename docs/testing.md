@@ -199,6 +199,19 @@ linker, `xdg-open` instead of `open`, and the `libc` `getpwuid` fallback that
 keeps the redactor working when a service manager strips `HOME` and `USER`.
 
 ```sh
+ssh <linux-host> 'rm -rf ~/ci/squelch/.git'          # see below
 rsync -az --delete --exclude 'target/' --exclude '.git/' ./ <linux-host>:~/ci/squelch/
 ssh <linux-host> 'cd ~/ci/squelch && nix flake check'
 ```
+
+**Delete `.git` on the far side, and mean it.** `--exclude '.git/'` tells rsync
+to ignore that directory on *both* ends, so `--delete` will not remove a stale
+one left by an earlier sync — and nix, finding a git repository, then builds
+from its **index** rather than from the files on disk. The result is a check
+that runs against whatever was tracked whenever that `.git` was copied, silently.
+It cost a full round here: `tests/issue_form.rs` failed on Linux and passed on
+macOS, and the difference was a `.git` three commits out of date.
+
+`nix flake check | tail` is the same class of mistake in one line: the pipe
+reports `tail`'s exit status, so a failing check reads as a passing one. Redirect
+to a file and check `$?`.
