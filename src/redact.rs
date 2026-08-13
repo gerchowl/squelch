@@ -328,10 +328,12 @@ impl Redactor {
             (mac_address_re(), "${1}<mac>${2}"),
             (ipv6_re(), "${1}<ip>${3}"),
             (ipv4_re(), "<ip>"),
-            (private_host_re(), "<host>"),
         ] {
             out = pattern.replace_all(&out, replacement).to_string();
         }
+        // Last, and not in the table above: the host rule needs the match in
+        // hand to decide, so it cannot be expressed as a replacement string.
+        out = mask_hosts(&out);
 
         for (token, host) in preserved {
             out = out.replace(&token, host);
@@ -612,7 +614,14 @@ fn git_remote_re() -> &'static Regex {
             # 'https://github.com/acme/prod-vault/' not found` — and every URL
             # a human pastes from a browser. The path is consumed to the end so
             # `/pull/42` and `/-/tree/main` cannot leave a tail behind.
-            | \bhttps?://(?:www\.)?(?:github|gitlab|bitbucket|codeberg|sr\.ht)\.[a-z]+/[^\s\x22]*
+            # The path class excludes `),;` so the rule cannot eat the
+            # punctuation after a URL and then the diagnosis that follows it.
+            | \bhttps?://(?:www\.)?(?:github|gitlab|bitbucket|codeberg)\.[a-z]+/[^\s\x22),;]*
+            # sourcehut is its own alternative because its host IS `sr.ht`:
+            # folded into the list above it required `sr.ht.<something>/`, which
+            # is not a host, so the branch could never match and every real
+            # sourcehut URL published its org and repository.
+            | \bhttps?://(?:git\.|hg\.)?sr\.ht/[^\s\x22),;]*
             # Any other host, still requiring `.git`: without a known forge
             # there is nothing to distinguish a repository URL from an ordinary
             # link, and masking every URL in a log would take the diagnosis
@@ -807,50 +816,125 @@ fn machine_id_re() -> &'static Regex {
 /// Three labels is the floor on purpose, with an alphabetic final label: it
 /// keeps `server.log` and `config.yml` intact, and stops version strings like
 /// `0.6.8-fork.85ce040` being mistaken for hosts.
+/// Suffixes that make a dotted run a hostname rather than an identifier.
+///
+/// Deliberately not exhaustive, and deliberately short of the "new gTLD"
+/// space. `app`, `dev`, `cloud`, `tech`, `systems`, `network`, `email`, `blog`
+/// and their neighbours are all real suffixes AND all common final segments of
+/// module paths, bundle ids and filenames — `com.example.app`,
+/// `config.yml.dev`, `some.package.name.systems`. Including them cost every
+/// mobile crash log its bundle id, which is the first thing a maintainer looks
+/// for.
+///
+/// `rs`, `sh`, `pl`, `md` and `so` are out for the same reason: they are file
+/// extensions far more often than they are Serbia, and `webpack.config.prod.js`
+/// must survive.
+///
+/// The trade is that a host on a suffix outside this list is not matched by
+/// *this* rule. The private-suffix rule, `user@host` and the git-remote rule
+/// are what cover the shapes that carry a name in practice.
+const HOST_SUFFIXES: &[&str] = &[
+    "com", "net", "org", "edu", "gov", "mil", "int", "info", "biz", "name", "pro", "coop", "aero",
+    "io", "co", "ai", "xyz", "eu", "us", "uk", "de", "fr", "jp", "cn", "ru", "br", "in", "au",
+    "ca", "ch", "nl", "se", "no", "fi", "dk", "es", "it", "be", "at", "cz", "pt", "gr", "hu", "ro",
+    "tr", "ua", "kr", "tw", "hk", "sg", "nz", "za", "mx", "ar", "cl", "ie", "il", "lt", "lv", "ee",
+    "sk", "si", "hr", "bg", "by", "kz", "th", "vn", "ph", "id", "my",
+];
+
+/// Suffixes that name a private network outright, wherever they appear.
+///
+/// A match containing one of these is masked without further argument: nothing
+/// legitimate is called `bastion.internal.acme.corp`.
+const PRIVATE_SUFFIXES: &[&str] = &[
+    "corp", "internal", "intranet", "local", "lan", "home", "priv", "private", "arpa",
+];
+
+/// Hostnames that identify a network rather than a public service.
+///
+/// The ssh-target rule only fires when there is a `user@`, and error strings
+/// overwhelmingly carry a bare FQDN instead ("Could not resolve hostname
+/// bastion.internal.acme.corp").
+///
+/// The pattern is built from [`HOST_SUFFIXES`] and [`PRIVATE_SUFFIXES`] rather
+/// than restating them, so the regex and the guards in [`mask_hosts`] cannot
+/// drift apart — which is the failure that would quietly turn the guards off.
 fn private_host_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(
+        let private = PRIVATE_SUFFIXES.join("|");
+        let public = HOST_SUFFIXES.join("|");
+        Regex::new(&format!(
             r"(?xi)
               # A private suffix, plus anything after it. The trailing group is
               # what stops the rule biting off `bastion.corp` and publishing
               # `acme-inc.com` — the interesting half of the name.
               [A-Za-z0-9_\-]+(?:\.[A-Za-z0-9_\-]+)*
-              \.(?:corp|internal|intranet|local|lan|home|priv|private|arpa)
+              \.(?:{private})
               (?:\.[A-Za-z0-9_\-]+)*\b
-            # Three or more labels under a REAL suffix, and case-sensitive.
-            #
-            # The final label used to be any run of letters, which is not a
-            # discriminator at all: `django.contrib.auth.models` has exactly
-            # the shape of a hostname, and so does every Python, Java, Kotlin
-            # and JS module path. Masking them cost a Django traceback the one
-            # line that says where the bug is, and a log block scrubbed into
-            # uselessness costs the maintainer the same round trip as no log
-            # block at all.
-            #
-            # What actually separates a host from a module path is the suffix,
-            # so the list below is the discriminator. It is deliberately not
-            # exhaustive: a host on an exotic TLD leaks, which is the trade
-            # being made, and the private-suffix rule above plus the `user@host`
-            # and git-remote rules catch the shapes that carry a name in
-            # practice. `rs`, `sh`, `pl`, `md` and `so` are OMITTED on purpose
-            # — they are file extensions far more often than they are Serbia,
-            # and `webpack.config.prod.js` must survive.
+            # Three or more labels under a real suffix, and case-sensitive:
+            # a capitalised label means a class name, and case-insensitivity
+            # ate `java.lang.Thread.run`.
             | (?-i:
-                [a-z0-9_\-]+(?:\.[a-z0-9_\-]+){1,}\.(?:
-                  com|net|org|edu|gov|mil|int|info|biz|name|pro|coop|aero
-                | io|co|ai|dev|app|cloud|tech|xyz|online|site|store|space
-                | website|team|group|systems|solutions|digital|agency|studio
-                | design|network|email|live|life|world|news|blog|wiki
-                | eu|us|uk|de|fr|jp|cn|ru|br|in|au|ca|ch|nl|se|no|fi|dk|es
-                | it|be|at|cz|pt|gr|hu|ro|tr|ua|kr|tw|hk|sg|nz|za|mx|ar|cl
-                | ie|il|lt|lv|ee|sk|si|hr|bg|by|kz|th|vn|ph|id|my
-                )
+                [a-z0-9_\-]+(?:\.[a-z0-9_\-]+){{1,}}\.(?:{public})
               )\b
-            ",
-        )
+            "
+        ))
         .expect("static private-host pattern")
     })
+}
+
+/// Apply [`private_host_re`], with the two guards a regex cannot express.
+///
+/// The suffix list alone is not a sufficient discriminator, because a hostname
+/// and a reverse-DNS identifier are the same string in opposite orders:
+///
+/// - **A hostname ENDS with its suffix; an identifier BEGINS with one.**
+///   `bastion.corp.acme.com` versus `com.example.app`. Testing only the final
+///   label masked every Android, Java and Apple bundle id in a crash log,
+///   which is the first line a maintainer reads.
+/// - **A hostname is not a prefix of a longer dotted run.** `std.foo.io` inside
+///   `std.foo.io.println` matched, and the result — `<host>.println` — says
+///   less than either half of it did.
+///
+/// Neither is expressible in this engine, which has no lookaround, so both are
+/// decided here with the match in hand.
+fn mask_hosts(text: &str) -> String {
+    private_host_re()
+        .replace_all(text, |caps: &regex::Captures<'_>| {
+            let Some(matched) = caps.get(0) else {
+                return String::new();
+            };
+            let found = matched.as_str();
+            let labels: Vec<&str> = found.split('.').collect();
+
+            // A private suffix anywhere is decisive; the guards below do not
+            // apply to it.
+            let is_private = labels.iter().any(|label| {
+                PRIVATE_SUFFIXES
+                    .iter()
+                    .any(|s| label.eq_ignore_ascii_case(s))
+            });
+            if is_private {
+                return "<host>".to_string();
+            }
+
+            let starts_with_a_suffix = labels
+                .first()
+                .is_some_and(|first| HOST_SUFFIXES.iter().any(|s| first.eq_ignore_ascii_case(s)));
+            let continues_past_the_match = text
+                .get(matched.end()..)
+                .and_then(|rest| rest.strip_prefix('.'))
+                .is_some_and(|rest| {
+                    rest.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+                });
+
+            if starts_with_a_suffix || continues_past_the_match {
+                found.to_string()
+            } else {
+                "<host>".to_string()
+            }
+        })
+        .to_string()
 }
 
 /// Another account's home directory. The current user's is rewritten to `~`
@@ -859,10 +943,17 @@ fn home_path_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            // Every alternative begins with a captured left delimiter, restored
-            // by the `${1}` in the replacement. See `scrub`.
+            // The captured left delimiter, restored by `${1}` in the
+            // replacement, applies ONLY to the alternatives that need one:
+            // `~name`, which would otherwise eat `HEAD~1`, and the driveless
+            // Windows path, which would otherwise match inside `MyUsers\bob`.
+            //
+            // Requiring it everywhere narrowed the absolute-path alternatives
+            // and reintroduced a leak: `prefix/home/alice/x` stopped matching,
+            // so any concatenated or prefix-tagged path published the account
+            // name. Group 1 simply does not participate in the alternatives
+            // below, and `${1}` expands to nothing there.
             r"(?xi)
-              (^|[^A-Za-z0-9_])
               (?:
                 (?:/Users|/home)/[^\s\x22/]+(?:/[^\s\x22]*)?
               # Root's home is still an account's home, and a path under it says
@@ -876,14 +967,14 @@ fn home_path_re() -> &'static Regex {
               # The first character must be a LETTER: `HEAD~1` and `main~2` are
               # git revisions, and with a digit allowed here every one of them
               # in a pasted command became `<path>`.
-              | ~[A-Za-z][A-Za-z0-9._\-]*(?:/[^\s\x22]*)?
+              | (^|[^A-Za-z0-9_])~[A-Za-z][A-Za-z0-9._\-]*(?:/[^\s\x22]*)?
               # A UNC path names the file server as well as the account.
               | \\\\[A-Za-z0-9._\-]+\\[^\s\x22]*
               # The drive letter is OPTIONAL. A stack trace prints the path
               # relative to the profile root, and `Users\bob\...` named the
               # account with nothing to stop it.
-              | (?:[A-Z]:)?\\?Users\\[^\\/\s\x22]+(?:\\[^\s\x22]*)?
-              | (?:[A-Z]:)?\\?Documents\ and\ Settings\\[^\\/\s\x22]+(?:\\[^\s\x22]*)?
+              | (^|[^A-Za-z0-9_])(?:[A-Z]:)?\\?Users\\[^\\/\s\x22]+(?:\\[^\s\x22]*)?
+              | (^|[^A-Za-z0-9_])(?:[A-Z]:)?\\?Documents\ and\ Settings\\[^\\/\s\x22]+(?:\\[^\s\x22]*)?
               )
             ",
         )
@@ -1282,6 +1373,88 @@ mod tests {
             ("could not resolve db01.prod.acme-inc.co.uk", "acme-inc"),
         ] {
             assert_gone(&redactor, input, kept);
+        }
+    }
+
+    #[test]
+    fn sourcehut_urls_lose_the_org_and_repository() {
+        // `(?:github|gitlab|...|sr\.ht)\.[a-z]+/` required a label AFTER the
+        // forge name, so the `sr.ht` alternative could only ever match
+        // `sr.ht.something/…`, which is not a host. Every real sourcehut URL
+        // went through, and the fallback alternative wants a `.git` suffix a
+        // browser-copied URL does not have.
+        let redactor = redactor();
+        for input in [
+            "https://sr.ht/orguser/prod-vault",
+            "https://git.sr.ht/~orguser/prod-vault",
+            "cloning https://git.sr.ht/~orguser/prod-vault failed",
+        ] {
+            assert_gone(&redactor, input, "orguser");
+            assert_gone(&redactor, input, "prod-vault");
+        }
+    }
+
+    #[test]
+    fn a_forge_url_does_not_swallow_the_sentence_after_it() {
+        // `[^\s\x22]*` ate trailing punctuation and then the rest of the
+        // line, so the diagnosis around the URL disappeared with it.
+        let redactor = redactor();
+        let out = redactor.scrub("issue at https://github.com/acme/vault/pull/42; then it dies");
+        assert!(
+            out.contains("then it dies"),
+            "the text after the URL was consumed: {out}"
+        );
+        let out = redactor.scrub("try https://github.com/acme/vault) and report");
+        assert!(out.contains("and report"), "{out}");
+    }
+
+    #[test]
+    fn a_home_path_is_masked_wherever_it_appears() {
+        // The captured left delimiter was added for the tilde alternative, and
+        // applying it to the absolute-path alternatives narrowed them: a
+        // `/Users/...` preceded by a word character stopped matching, so a
+        // concatenated or prefix-tagged path leaked the account name.
+        let redactor = redactor();
+        for input in [
+            "/home/someone/x",
+            "at /home/someone/x",
+            "path=/home/someone/x",
+            "file:///home/someone/x",
+            "prefix/home/someone/x",
+            "\"/home/someone/x\"",
+        ] {
+            assert_gone(&redactor, input, "someone");
+        }
+    }
+
+    #[test]
+    fn reverse_dns_identifiers_are_not_hostnames() {
+        // A hostname ENDS with its suffix; a reverse-DNS identifier BEGINS with
+        // one. The TLD list could not tell them apart, so every Android, Java
+        // and Apple bundle id became `<host>` — `com.example.app` is the single
+        // most common identifier shape in a mobile crash log.
+        let redactor = redactor();
+        for input in [
+            "com.example.app crashed",
+            "launched bundle com.apple.dock.app",
+            "at org.jetbrains.kotlin.compiler.plugin",
+            "uk.co.example.service started",
+        ] {
+            assert_eq!(redactor.scrub(input), input, "mangled a reverse-DNS id");
+        }
+    }
+
+    #[test]
+    fn a_dotted_run_longer_than_the_match_is_left_alone() {
+        // The rule matched a PREFIX of a longer dotted path and masked it,
+        // leaving a tail — `<host>.println` says less than either half.
+        let redactor = redactor();
+        for input in [
+            "stack: at std.foo.io.println",
+            "error opening config.yml.dev.bak",
+            "some.long.package.name.systems.thing",
+        ] {
+            assert_eq!(redactor.scrub(input), input, "bit a prefix out of a path");
         }
     }
 

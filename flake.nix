@@ -43,10 +43,12 @@
             msrv = devkit.lib.mkRustProject {
               inherit pkgs;
               src = ./.;
-              # `-p squelch`, default features, and NOT the workspace: the
-              # MSRV is a promise about the PUBLISHED crate, and the demo app
-              # is not published. `--all-features` is wrong here for a reason
-              # worth writing down — see the `endpoint` note in README.
+              # `-p squelch` and NOT `--workspace`: the MSRV is a promise
+              # about the PUBLISHED crate, and the demo app is not published.
+              #
+              # `--all-features` because the promise has to cover the features
+              # a consumer can turn on — and it is `endpoint` that sets the
+              # floor here, by way of ureq → url → idna → idna_adapter.
               cargoExtraArgs = "-p squelch --all-features";
               toolchainFile = ./.msrv/rust-toolchain.toml;
               toolchainHash = "sha256-X/4ZBHO3iW0fOenQ3foEvscgAPJYl2abspaBThDOukI=";
@@ -104,13 +106,14 @@
         pkgs: msrv: rust:
         rust.checks
         // {
-          # `rust-version = "1.74"` is a promise about this crate's API surface,
-          # and it was verified by nothing: the suite stayed green while a
-          # consumer pinned there would have failed to build. A declared but
-          # unverified MSRV is a FALSE promise, not a weak one — the failure
-          # lands on the downstream, who has no way to tell it from their own
-          # mistake. Either this check passes or the declaration comes out of
-          # Cargo.toml.
+          # `rust-version` is a promise about this crate's API surface, and it
+          # was verified by nothing. A declared but unverified MSRV is a FALSE
+          # promise, not a weak one — the failure lands on the downstream, who
+          # has no way to tell it from their own mistake.
+          #
+          # It said 1.74 when nothing checked, and 1.74 cannot build this crate
+          # at all. The number in Cargo.toml is now whatever this check passes
+          # with, or the declaration comes out.
           msrv = msrv.checks.workspace;
           # Every feature combination must COMPILE — the pack's checks all run
           # with one feature set, and `--all-features` is the set least likely
@@ -135,8 +138,14 @@
               inherit (rust) cargoArtifacts;
               pnameSuffix = "-feature-powerset";
               nativeBuildInputs = (rust.commonArgs.nativeBuildInputs or [ ]) ++ [ pkgs.cargo-hack ];
+              # `--offline`, not `--locked`. `--no-dev-deps` rewrites the real
+              # Cargo.toml while it runs, and once a dev-dependency is dev-ONLY
+              # (proptest, the YAML parser) the lock then describes packages the
+              # manifest no longer mentions, so `--locked` refuses. `--offline`
+              # is just as hermetic here: crane has vendored every dependency
+              # and the sandbox has no network to fall back to.
               buildPhaseCargoCommand = ''
-                cargo hack check -p squelch --feature-powerset --no-dev-deps --locked
+                cargo hack check -p squelch --feature-powerset --no-dev-deps --offline
               '';
             }
           );

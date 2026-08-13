@@ -32,7 +32,7 @@
 //! model that mirrors the implementation agrees with the bug.
 
 use proptest::prelude::*;
-use squelch::{Destination, Field, Form, Provenance, Report, Value};
+use squelch::{Destination, Field, Form, Provenance, Record, Report, Value};
 
 fn destination() -> Destination {
     Destination::parse("gerchowl/squelch").expect("a literal slug")
@@ -50,6 +50,11 @@ enum Op {
     ProvenanceField(String),
     Provenance(Vec<(String, String)>),
     UseForm(Vec<(String, bool)>),
+    /// The one operation that is NOT adopt-style, generated so the exclusion
+    /// is enforced rather than asserted in a comment. Two independent sources
+    /// of the same warning must both survive, so doubling this one is REQUIRED
+    /// to be observable — property 1 checks that direction too.
+    Diagnostics(Vec<String>),
 }
 
 impl Op {
@@ -80,7 +85,19 @@ impl Op {
                 .template("bug.yml");
                 report.form(&form)
             }
+            Self::Diagnostics(messages) => {
+                report.diagnostics(messages.iter().map(|message| Record {
+                    timestamp: "2026-08-13T00:00:00Z".into(),
+                    level: "error".into(),
+                    source: None,
+                    fields: vec![("message".into(), message.clone())],
+                }))
+            }
         }
+    }
+
+    fn is_adopt_style(&self) -> bool {
+        !matches!(self, Self::Diagnostics(_))
     }
 }
 
@@ -122,8 +139,48 @@ fn op() -> impl Strategy<Value = Op> {
         prop::collection::vec(("[A-Za-z]{1,10}", "[A-Za-z0-9 .]{0,40}"), 0..4)
             .prop_map(Op::Provenance),
         prop::collection::vec((id(), any::<bool>()), 0..4).prop_map(Op::UseForm),
+        prop::collection::vec("[a-z ]{1,30}", 1..3).prop_map(Op::Diagnostics),
     ]
 }
+
+/// Field operations that COMPETE for the URL budget.
+///
+/// The conservation property exists to catch a field that vanishes from the
+/// URL while the reporter approved a preview containing it — and with only
+/// arbitrary operations, that branch never ran: `dropped` was non-empty in
+/// about one case in seventy, and never for an id the oracle knew about. A
+/// property whose central assertion is unreachable is worse than a missing
+/// test, because it is counted as coverage.
+///
+/// So the sequence always ends with two to four fields whose combined length
+/// straddles `MAX_URL_LEN`, which is what makes truncation and dropping the
+/// common case rather than the vanishing one.
+fn competing_fields() -> impl Strategy<Value = Vec<Op>> {
+    prop::collection::vec(
+        (
+            id(),
+            prop_oneof![
+                (2_000usize..6_000).prop_map(|n| "x".repeat(n)),
+                (1usize..200).prop_map(|n| "y".repeat(n)),
+                (500usize..2_500).prop_map(|n| "é".repeat(n)),
+            ],
+        ),
+        2..5,
+    )
+    .prop_map(|fields| {
+        fields
+            .into_iter()
+            .map(|(id, value)| Op::Field(id, value))
+            .collect()
+    })
+}
+
+/// `url::MAX_URL_LEN`, restated because it is not public.
+///
+/// Restating it is the point: if the crate raises its budget without this
+/// following, the coverage assertion below starts failing, which is the right
+/// way round — a silent divergence would make the assertion vacuous instead.
+const MAX_URL_LEN: usize = 7_500;
 
 /// The observable result of a sequence: everything a surface can see, and
 /// everything that decides what the reporter believes they are sending.
@@ -134,6 +191,12 @@ struct Observed {
     dropped: Vec<String>,
     body: String,
     missing: Option<Vec<String>>,
+}
+
+impl Observed {
+    fn is_lossy(&self) -> bool {
+        !self.shortened.is_empty() || !self.dropped.is_empty()
+    }
 }
 
 fn observe(ops: &[Op]) -> Observed {
@@ -175,13 +238,32 @@ proptest! {
         let mut doubled = ops.clone();
         doubled.insert(at, ops[at].clone());
 
-        prop_assert_eq!(
-            observe(&ops),
-            observe(&doubled),
-            "applying op {} twice was observable; adopt-style state is being \
-             appended to rather than replaced",
-            at
-        );
+        if ops[at].is_adopt_style() {
+            prop_assert_eq!(
+                observe(&ops),
+                observe(&doubled),
+                "applying op {} twice was observable; adopt-style state is \
+                 being appended to rather than replaced",
+                at
+            );
+        } else {
+            // `diagnostics` means "add these records", not "install this named
+            // thing". Asserting the exclusion in this direction is what keeps
+            // it from being quietly widened into the property above, which
+            // would make the whole thing agree with an implementation that
+            // deduplicated two independent reports of the same warning.
+            //
+            // Only when something was actually composed: a report refused for
+            // a missing field carries no diagnostics either way, and that is
+            // the refusal working, not a lost record.
+            prop_assume!(observe(&ops).missing.is_none());
+            prop_assert_ne!(
+                observe(&ops),
+                observe(&doubled),
+                "doubling `diagnostics` was NOT observable; two independent \
+                 sources of the same warning must both survive"
+            );
+        }
     }
 
     /// Property 1, corollary: a duplicated id is reported once.
@@ -212,8 +294,10 @@ proptest! {
     /// is a lossy encoder lying about its loss.
     #[test]
     fn every_loss_is_named_and_every_name_is_a_loss(
-        ops in prop::collection::vec(op(), 1..8),
+        prefix in prop::collection::vec(op(), 0..5),
+        competing in competing_fields(),
     ) {
+        let ops: Vec<Op> = prefix.into_iter().chain(competing).collect();
         let observed = observe(&ops);
         prop_assume!(observed.missing.is_none());
 
@@ -303,6 +387,43 @@ proptest! {
                 "{id} survived whole but is reported as shortened. A warning \
                  that fires when nothing was lost is a warning nobody reads on \
                  the one occasion it matters."
+            );
+        }
+
+        // The BODY is the other half of "closure", and the property was
+        // reading only the URL — a `render_body` regression that silently
+        // dropped a section would have passed. The body is the route with no
+        // size limit, so every answer belongs in it whatever the URL did.
+        for (id, value) in &asked {
+            if provenance_attached && *id == provenance_field {
+                continue;
+            }
+            if value.trim().is_empty() {
+                continue;
+            }
+            prop_assert!(
+                observed.body.contains(value.trim_end()),
+                "{id} is missing from the body. The URL is allowed to lose it \
+                 — that is what `dropped` is for — but a File, mail, `gh` or \
+                 endpoint report carries the whole thing, and those routes read \
+                 the body."
+            );
+        }
+
+        // Coverage, asserted rather than hoped for. If the generated fields
+        // plainly exceed the budget and NOTHING is reported lost, either the
+        // manifest is lying or the generators have drifted back to producing
+        // values too small to reach the branch this property exists for.
+        let total: usize = asked
+            .iter()
+            .filter(|(id, _)| !(provenance_attached && *id == provenance_field))
+            .map(|(id, value)| id.len() + value.len() + 2)
+            .sum();
+        if total > 2 * MAX_URL_LEN {
+            prop_assert!(
+                observed.is_lossy(),
+                "{total} characters of answers went into a {MAX_URL_LEN}-character \
+                 budget and the manifest reports no loss at all"
             );
         }
 
