@@ -94,6 +94,31 @@ asserts the shape instead, over generated sequences of builder operations:
 | conservation | a lossy encoder reporting less loss than it caused — everything absent or truncated in the URL is named in `shortened`/`dropped`, and nothing named survived intact |
 | round-trip | `skeleton` → `parse_skeleton` losing an answer because the reporter's own text imitated a delimiter |
 
+### A property can pass while asserting nothing
+
+The first version of this suite was reviewed by an agent that instrumented it
+and counted branch hits. The result was worth more than any finding: over 447
+generated cases, the assertion the whole property exists for — *a field vanished
+from the URL and nothing named it* — **ran zero times**. Arbitrary builder
+operations almost never produce values that compete for a 7 500-character
+budget, so the branch was unreachable in practice while the test reported
+success.
+
+That is worse than having no test, because it is counted as coverage.
+
+Two things fix it, and both are needed:
+
+- The generated sequence always ends with two to four fields whose combined
+  length straddles the budget, so truncation and dropping are the common case
+  rather than the vanishing one. The drop branch now runs about 140 times a run.
+- A **coverage assertion** fails the suite if answers plainly exceeding the
+  budget produce a manifest reporting no loss at all — so the generators cannot
+  quietly drift back to producing values too small to reach it.
+
+The same review found the property was reading only the URL, despite a docstring
+promising closure between body, URL and manifest. A `render_body` regression
+that dropped a section would have passed.
+
 Three rules keep it honest:
 
 - **The oracle is written from the contract, not from `url::build`.** A shadow
