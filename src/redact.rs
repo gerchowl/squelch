@@ -62,13 +62,18 @@
 //! matched by *this* rule; the private-suffix, `user@host` and git-remote
 //! rules are what cover the shapes that carry a name in practice.
 //!
-//! **A bare two-label `<word>.local`.** `printer.local` is kept, because
-//! `.env.local`, `settings.local` and `keys.private` are the same shape and
-//! are in every project there is. At two labels the name has to *look* like a
-//! machine — a digit or a hyphen — before it is treated as one. That is a
-//! narrower loss than it sounds: the names which actually identify a person
-//! are the ones macOS and DHCP generate, and those carry hyphens
-//! (`alices-macbook.local` is masked).
+//! **A bare two-label `<word>.local` or `<word>.private`.** `printer.local` is
+//! kept, because `.env.local`, `settings.local` and `keys.private` are the same
+//! shape and are in every project there is. At two labels a name under one of
+//! those two suffixes has to *look* like a machine — a digit or a hyphen —
+//! before it is treated as one. That is a narrower loss than it sounds: the
+//! names which actually identify a person are the ones macOS and DHCP
+//! generate, and those carry hyphens (`alices-macbook.local` is masked).
+//!
+//! Only those two suffixes. There is no `settings.corp` or `keys.intranet`, so
+//! `bastion.corp`, `vault.internal` and `db.lan` are masked at two labels like
+//! anything else — relaxing every private suffix uniformly leaked exactly the
+//! names the rule exists for.
 //!
 //! The trade runs the other way too. A three-label filename ending in a
 //! private suffix — `docker-compose.override.local` — is masked, because at
@@ -912,6 +917,16 @@ const COMPOUND_SUFFIXES: &[&str] = &[
     "co.nz", "co.za", "co.in", "com.cn", "com.mx", "com.tr",
 ];
 
+/// Private suffixes that are also ordinary words, and so collide with real
+/// filenames: `.env.local`, `settings.local`, `keys.private`, `config.local`.
+///
+/// Only these get the two-label relaxation. There is no `settings.corp` or
+/// `keys.intranet`, so `corp`, `internal`, `intranet`, `lan`, `home`, `priv`
+/// and `arpa` are masked at two labels like any other — relaxing them
+/// uniformly leaked `bastion.corp` and `vault.internal`, which are exactly the
+/// names the rule exists for.
+const WORDLIKE_PRIVATE_SUFFIXES: &[&str] = &["local", "private"];
+
 /// Whether a label looks like it names a machine rather than a word.
 ///
 /// A digit or a hyphen is the cheapest positive signal there is: `db01`,
@@ -957,15 +972,38 @@ fn mask_hosts(text: &str) -> String {
                 return keep();
             };
 
-            // A private suffix, and only when it is the last label.
+            // A reverse-DNS identifier begins with the suffix a hostname ends
+            // with. Decided first, because the private-suffix rules below must
+            // not fire on `com.foo.internal.Impl`.
+            let starts_with_a_suffix = labels
+                .first()
+                .is_some_and(|first| is(first, HOST_SUFFIXES) || is(first, PRIVATE_SUFFIXES));
+            if starts_with_a_suffix {
+                return keep();
+            }
+
+            // A private suffix in the last position.
             if is(last, PRIVATE_SUFFIXES) {
-                let preceding = labels.len().saturating_sub(1);
-                return if preceding >= 2 || labels.first().is_some_and(|l| looks_like_a_machine(l))
-                {
+                // Two labels is enough unless the suffix is also a word, in
+                // which case the name has to look like a machine — see
+                // `WORDLIKE_PRIVATE_SUFFIXES`.
+                let relaxable = is(last, WORDLIKE_PRIVATE_SUFFIXES) && labels.len() <= 2;
+                return if !relaxable || labels.first().is_some_and(|l| looks_like_a_machine(l)) {
                     mask()
                 } else {
                     keep()
                 };
+            }
+
+            // A private label MID-RUN, in a run that is entirely lowercase.
+            // `bastion.corp.acme-inc` is corporate DNS with no public suffix at
+            // the end, and requiring one let every such name through. The
+            // package paths that share the shape carry a capital — a class
+            // name — or begin with a suffix, which is already handled above.
+            if labels.iter().any(|label| is(label, PRIVATE_SUFFIXES))
+                && !found.chars().any(|c| c.is_ascii_uppercase())
+            {
+                return mask();
             }
 
             // Otherwise it has to end in a public suffix to be a host at all.
@@ -983,15 +1021,6 @@ fn mask_hosts(text: &str) -> String {
                         .any(|s| pair.eq_ignore_ascii_case(s))
                 });
             if !compound && !is(last, HOST_SUFFIXES) {
-                return keep();
-            }
-
-            // A reverse-DNS identifier begins with the suffix a hostname ends
-            // with.
-            if labels
-                .first()
-                .is_some_and(|first| is(first, HOST_SUFFIXES) || is(first, PRIVATE_SUFFIXES))
-            {
                 return keep();
             }
 
@@ -1610,6 +1639,50 @@ mod tests {
             ("resolve web.default.svc.cluster.local", "default"),
             ("resolve alices-macbook.local failed", "alices-macbook"),
             ("resolve db01.local failed", "db01"),
+        ] {
+            assert_gone(&redactor, input, secret);
+        }
+    }
+
+    #[test]
+    fn corporate_dns_without_a_public_tld_is_still_a_host() {
+        // A private root with no public suffix at the end — `bastion.corp.acme-inc`
+        // — is an ordinary corporate DNS shape. Requiring the last label to be
+        // a known suffix let every one of them through.
+        let redactor = redactor();
+        for (input, secret) in [
+            ("resolve bastion.corp.acme-inc failed", "acme-inc"),
+            ("resolve mydb.corp.deploys failed", "deploys"),
+            ("resolve vault.internal.subnet1 failed", "subnet1"),
+            ("resolve bastion.corp.acme-inc.com failed", "acme-inc"),
+        ] {
+            assert_gone(&redactor, input, secret);
+        }
+        // …while the reverse-DNS packages that share the shape stay. The
+        // discriminator is case: a hostname label is conventionally lowercase,
+        // and a class name is not.
+        for input in [
+            "at com.foo.internal.Impl",
+            "kotlin.internal.PlatformDependent",
+            "com.acme.internal.security.Token",
+        ] {
+            assert_eq!(redactor.scrub(input), input, "mangled a package path");
+        }
+    }
+
+    #[test]
+    fn only_the_suffixes_with_a_filename_analog_are_relaxed() {
+        // The two-label relaxation exists because `.env.local` and
+        // `keys.private` are real files. There is no `settings.corp` or
+        // `keys.intranet`, so those suffixes get no such licence.
+        let redactor = redactor();
+        for (input, secret) in [
+            ("connect to bastion.corp failed", "bastion"),
+            ("connect to vault.internal failed", "vault"),
+            ("connect to gitlab.intranet failed", "gitlab"),
+            ("connect to db.lan failed", "db"),
+            ("connect to router.home failed", "router"),
+            ("connect to safe.priv failed", "safe"),
         ] {
             assert_gone(&redactor, input, secret);
         }

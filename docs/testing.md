@@ -155,6 +155,28 @@ edition 2024, which that Cargo cannot parse. A declared-but-unverified MSRV is a
 *false* promise rather than a weak one: the suite stays green and the failure
 lands on a downstream who cannot tell it from their own mistake.
 
+## The reviewer who blocks the fix for the review
+
+The host rule went through three rounds in one sitting, and each round's fix
+opened the next round's defect:
+
+1. The suffix list alone masked every Java and Kotlin stack frame, because
+   `django.contrib.auth.models` is shaped like a hostname.
+2. The guards that fixed that masked `.env.local` and `com.foo.internal.Impl`,
+   because a private suffix was matched anywhere in the run.
+3. The relaxation that fixed *that* leaked `bastion.corp`, `vault.internal` and
+   `bastion.corp.acme-inc` — corporate DNS with no public suffix at the end,
+   which is precisely what the rule exists for.
+
+Round 3 was caught by a fresh reviewer reading the shipped diff, not by the
+tests written in round 2. That is the argument for reviewing the *fix* and not
+only the bug: each narrowing looked obviously correct against the case that
+motivated it, and each was wrong about the case next door.
+
+What finally separates the two is not the suffix list at all. A hostname label
+is conventionally lowercase and a class name is not, so an all-lowercase run
+containing a private label is DNS and one carrying a capital is a package path.
+
 ## No git-hook layer, deliberately
 
 Two org tooling systems want to own the hook layer, and the concern was that
