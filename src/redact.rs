@@ -319,7 +319,7 @@ impl Redactor {
             (secret_token_re(), "<redacted-token>"),
             // Before `labeled_secret_re`, which would otherwise consume the
             // `id=` and leave the identifier itself standing.
-            (machine_id_re(), "${1}${2}=<machine-id>"),
+            (machine_id_re(), "${1}${2}${3}<machine-id>"),
             (labeled_secret_re(), "${1}${2}${3}${4}=<redacted>"),
             (email_re(), "<email>"),
             (ssh_target_re(), "<ssh-target>"),
@@ -799,7 +799,11 @@ fn machine_id_re() -> &'static Regex {
               | serial(?:[-_\ ]?(?:number|no|num))?
               | udid
               | imei)
-              \s*[:=]?\s*
+              # The separator is CAPTURED and restored, not normalised. It was
+              # rewritten to `=` whatever the log actually said, which is the
+              # crate editing text it was only asked to redact — in a preview
+              # whose whole promise is that it shows what would leave.
+              (\s*[:=]?\s*)
               [A-Za-z0-9][A-Za-z0-9._:\-]{5,}
             ",
         )
@@ -1311,6 +1315,28 @@ mod tests {
         // with the IPv6 rule. Dash-form had nothing.
         assert_gone(&redactor, "iface aa-bb-cc-dd-ee-ff up", "aa-bb-cc-dd-ee-ff");
         assert_gone(&redactor, "iface aa:bb:cc:dd:ee:ff up", "aa:bb:cc:dd:ee:ff");
+    }
+
+    #[test]
+    fn a_masked_identifier_keeps_the_separator_it_was_written_with() {
+        // The rule normalised whatever separator it matched to `=`, so
+        // `machine id: <uuid>` came back as `machine id=<machine-id>`. Small,
+        // but it is the crate rewriting text it was only asked to redact —
+        // and the reporter is being shown a preview of "what would leave".
+        let redactor = redactor();
+        for (input, expected) in [
+            (
+                "machine-id: 550e8400-e29b-41d4-a716-446655440000",
+                "machine-id: <machine-id>",
+            ),
+            (
+                "device_id=550e8400-e29b-41d4-a716-446655440000",
+                "device_id=<machine-id>",
+            ),
+            ("serial number C02XG2JMJGH8", "serial number <machine-id>"),
+        ] {
+            assert_eq!(redactor.scrub(input), expected, "{input:?}");
+        }
     }
 
     #[test]
