@@ -929,6 +929,18 @@ const COMPOUND_SUFFIXES: &[&str] = &[
     "co.nz", "co.za", "co.in", "com.cn", "com.mx", "com.tr",
 ];
 
+/// Suffixes a reverse-DNS identifier actually begins with.
+///
+/// Every two-letter ccTLD is a public suffix, so testing "the first label is a
+/// suffix" excused `us.internal.acme.com` — a corporate host, published whole.
+/// The roots an Android, Java or Apple identifier really starts with are a
+/// much smaller set, and none of them is two letters.
+///
+/// A reverse-DNS name under a ccTLD (`uk.co.example.app`) is therefore masked.
+/// That is the trade, and it runs the safe way: a mangled package path costs a
+/// round trip, a published hostname does not come back.
+const REVERSE_DNS_ROOTS: &[&str] = &["com", "org", "net", "edu", "gov", "mil", "int", "io", "dev"];
+
 /// Private suffixes that are also ordinary words, and so collide with real
 /// filenames: `.env.local`, `settings.local`, `keys.private`, `config.local`.
 ///
@@ -984,6 +996,18 @@ fn mask_hosts(text: &str) -> String {
                 return keep();
             };
 
+            // A match that stops immediately before a `-` is a FRAGMENT of a
+            // longer token, not a name. The pattern's trailing group needs a
+            // `.` to continue, so `com.acme.internal-tools.util.Client` matched
+            // only `com.acme.internal` and was judged as if that were the whole
+            // thing — masking the front of an ordinary package path.
+            if text
+                .get(matched.end()..)
+                .is_some_and(|rest| rest.starts_with('-'))
+            {
+                return keep();
+            }
+
             // The order below IS the rule. Each of the three preceding rounds
             // on this function got it wrong by testing the right things in the
             // wrong sequence.
@@ -1009,7 +1033,17 @@ fn mask_hosts(text: &str) -> String {
             //    standing in for this and is not the same test: Windows and AD
             //    hostnames are routinely capitalised, so it switched the rule
             //    off on exactly the hosts it exists for.
-            if last.starts_with(|c: char| c.is_ascii_uppercase()) {
+            //
+            //    CamelCase, not merely a leading capital — `.COM` and `.NET`
+            //    start with one too, and an operator who shouts the TLD is not
+            //    writing Java. A class name has a lowercase letter after it.
+            //    And a label that IS a suffix is a suffix however it is
+            //    cased. `Com` is CamelCase by shape and a TLD by meaning.
+            let camel_case = last.starts_with(|c: char| c.is_ascii_uppercase())
+                && last.chars().any(|c| c.is_ascii_lowercase())
+                && !is(last, HOST_SUFFIXES)
+                && !is(last, PRIVATE_SUFFIXES);
+            if camel_case {
                 return keep();
             }
 
@@ -1025,7 +1059,7 @@ fn mask_hosts(text: &str) -> String {
             if labels.iter().any(|label| is(label, PRIVATE_SUFFIXES)) {
                 let reverse_dns = labels
                     .first()
-                    .is_some_and(|first| is(first, HOST_SUFFIXES) || is(first, PRIVATE_SUFFIXES))
+                    .is_some_and(|first| is(first, REVERSE_DNS_ROOTS))
                     && !labels.iter().any(|label| looks_like_a_machine(label));
                 return if reverse_dns { keep() } else { mask() };
             }
@@ -1034,7 +1068,7 @@ fn mask_hosts(text: &str) -> String {
             //    ends with: `com.example.app` against `bastion.corp.acme.com`.
             if labels
                 .first()
-                .is_some_and(|first| is(first, HOST_SUFFIXES) || is(first, PRIVATE_SUFFIXES))
+                .is_some_and(|first| is(first, REVERSE_DNS_ROOTS))
             {
                 return keep();
             }
@@ -1718,6 +1752,56 @@ mod tests {
         ] {
             assert_gone(&redactor, input, secret);
         }
+    }
+
+    #[test]
+    fn a_shouted_tld_is_still_a_tld() {
+        // "Last label starts with a capital" was standing in for "is a class
+        // name", and an operator who types `.COM` — or a Windows event log
+        // that does — is not writing Java. A class name is CamelCase: it has a
+        // lowercase letter after the capital.
+        let redactor = redactor();
+        for (input, secret) in [
+            ("resolve bastion.internal.acme.NET", "acme"),
+            ("resolve bastion.internal.acme.Com", "acme"),
+            ("resolve bastion.corp.acme-inc.COM", "acme-inc"),
+        ] {
+            assert_gone(&redactor, input, secret);
+        }
+        assert_eq!(
+            redactor.scrub("at com.foo.internal.Impl"),
+            "at com.foo.internal.Impl"
+        );
+    }
+
+    #[test]
+    fn a_country_code_is_not_a_reverse_dns_root() {
+        // Every two-letter ccTLD is a public suffix, so "begins with a suffix"
+        // excused `us.internal.acme.com` — a corporate host, published whole.
+        // Reverse-DNS roots are a much smaller set than public suffixes.
+        let redactor = redactor();
+        for (input, secret) in [
+            ("resolve us.internal.acme.com", "acme"),
+            ("resolve de.internal.acme.com", "acme"),
+            ("resolve us.acme-inc.com", "acme-inc"),
+        ] {
+            assert_gone(&redactor, input, secret);
+        }
+        // …and the real reverse-DNS roots still excuse a package.
+        for input in ["at com.acme.internal.util", "at io.netty.internal.buffer"] {
+            assert_eq!(redactor.scrub(input), input, "mangled a package path");
+        }
+    }
+
+    #[test]
+    fn a_hyphen_after_a_suffix_means_the_run_is_longer() {
+        // `com.acme.internal-tools.util.Client` came back as
+        // `<host>-tools.util.Client`: the pattern stopped at `internal`,
+        // because its trailing group needs a `.`, and the fragment was judged
+        // as if it were the whole name.
+        let redactor = redactor();
+        let input = "at com.acme.internal-tools.util.Client";
+        assert_eq!(redactor.scrub(input), input, "masked a fragment of a path");
     }
 
     #[test]
