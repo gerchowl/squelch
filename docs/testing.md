@@ -168,14 +168,41 @@ opened the next round's defect:
    `bastion.corp.acme-inc` — corporate DNS with no public suffix at the end,
    which is precisely what the rule exists for.
 
-Round 3 was caught by a fresh reviewer reading the shipped diff, not by the
-tests written in round 2. That is the argument for reviewing the *fix* and not
-only the bug: each narrowing looked obviously correct against the case that
-motivated it, and each was wrong about the case next door.
+It did not stop at three. Rounds four and five each found two more leaks —
+`Bastion.internal.acme-inc` (any capital disabled the rule, and AD hostnames are
+capitalised), `int.acme.corp` (a leading TLD gave a free pass),
+`bastion.internal.acme.NET` (a shouted TLD), `us.internal.acme.com` (every
+ccTLD is a public suffix, so it read as a reverse-DNS root).
 
-What finally separates the two is not the suffix list at all. A hostname label
-is conventionally lowercase and a class name is not, so an all-lowercase run
-containing a private label is DNS and one carrying a capital is a package path.
+Every one was found by a fresh adversarial review. **None was found by the
+tests the previous round had written.** That is the argument for reviewing the
+*fix* and not only the bug: each narrowing was correct about the case that
+motivated it and wrong about the case next door.
+
+### When to stop patching
+
+After five rounds a design review was asked a different question — not "what is
+still broken" but "is this converging?" The answer was no, and the evidence was
+the code: six constants, none of which carries information about hostnames as
+such. Each is a scar from one round's motivating case.
+
+A hostname and a reverse-DNS identifier are the same string in opposite orders.
+Over a context-free dotted token there is no discriminator that is not a prior,
+so every version of the rule must have both false positives and false
+negatives, and the only question is which corpus the prior is tuned against.
+Tuning it against an adversarial test set that grows every time the tuning
+changes is chasing a fixpoint that is not there.
+
+The rule as it stands is kept — it fixes five rounds of real leaks and real
+over-masking, and is strictly better than what preceded it — but it is now
+documented as a prior rather than a classifier, its two residual leaks are
+named at the module, and the replacement is #5 rather than a sixth patch here.
+
+The lesson worth carrying: **a run of fixes that each look obviously correct is
+itself evidence.** The question to ask after the third one is not "what did I
+miss" but "can this shape be right at all", and the thing to build before the
+answer is "no" is a differential test against real corpora — which would have
+surfaced the whole pattern on its first run.
 
 ## No git-hook layer, deliberately
 
