@@ -67,6 +67,22 @@ so a reviewer sees an intact token in the preview and no reason to object.
 
 An allowlist rather than a denylist because a denylist fails open the moment someone adds a log field, and nobody revisits a denylist when they add one. With an allowlist the worst case is a report that's less useful than it could be.
 
+### The other end of the same concern
+
+squelch scrubs secrets on the way **out**, in a bug report. It cannot help with
+what your logging already wrote down. [`gerchowl/guardrails`][guardrails] ships a
+`no-raw-trace-fields` gate for that end — it flags raw `?`/`%` field formatters
+in `tracing` macros (`info!(user = ?user)`), which splat an arbitrary value's
+`Debug` into the audit trail and are the reflex way PII gets there in the first
+place.
+
+A project doing one and not the other has a hole. squelch itself doesn't adopt
+that gate, for the plainest reason: it has no `tracing` dependency and emits no
+logs of its own — it *consumes* yours. The gate would match nothing here. If
+your application is the one doing the logging, it is the one that wants it.
+
+[guardrails]: https://github.com/gerchowl/guardrails
+
 There's a test pinning the strings that must *survive* — `No such file or directory (os error 2)`, `server.log`, `0.6.8-fork.85ce040` — because over-masking makes the block worthless just as surely as under-masking makes it dangerous.
 
 ## Nothing reaches the tracker without passing one choke point

@@ -155,6 +155,34 @@ edition 2024, which that Cargo cannot parse. A declared-but-unverified MSRV is a
 *false* promise rather than a weak one: the suite stays green and the failure
 lands on a downstream who cannot tell it from their own mistake.
 
+## No git-hook layer, deliberately
+
+Two org tooling systems want to own the hook layer, and the concern was that
+adopting both means two hook managers fighting with the loser's hooks silently
+not running. Checked rather than assumed: **there is no collision, and there is
+no hook layer here at all.**
+
+devkit's hooks are opt-in — `mkRustProject` takes `hooks ? null`, and with the
+default the whole branch is dead code. Even when a consumer opts in, devkit
+passes `install.enable = false` to git-hooks.nix specifically so it does *not*
+rewrite `.git/hooks` or `core.hooksPath`; it only maintains a config symlink.
+`.githooks/` belongs to devkit's workspace-scaffold template, not to
+`mkRustProject`. So nothing in squelch installs a hook today, and nothing would
+fight if something did.
+
+The one gate that looked genuinely additive — guardrails' `no-raw-trace-fields`,
+which stops raw `?`/`%` `tracing` formatters putting secrets into an audit trail
+— **matches nothing in this repo**. squelch has no `tracing` or `log`
+dependency and emits no logs of its own; it consumes an application's. Adopting
+it would be adding a gate that asserts nothing, which is the failure this
+document already spends a section on. It belongs in the README as advice to
+consumers, and that is where it is.
+
+What a hook layer would add over the nine flake checks is faster local feedback
+on checks that already run, plus commit-message and branch-name shape. Neither
+is worth a second config to keep in sync for a crate this size. Enabling
+devkit's set later is a one-line `hooks = { … }` if that changes.
+
 ## Supply chain
 
 `deny.toml` turns on `cargo deny check` — advisories, licences, bans, sources.
