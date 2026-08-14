@@ -87,10 +87,32 @@
 //!
 //! A filename or a frame costs a round trip; a hostname does not come back.
 //!
-//! One known leak, kept because the fix endangers a common case: an address
-//! immediately followed by a dotted name — `10.1.2.3.acme.local` — leaves
-//! `acme.local` behind, because the IP rule runs first and the remaining two
-//! labels then look like `.env.local`.
+//! Two known leaks, both consequences of the `.local` relaxation and both
+//! kept because the fix endangers `.env.local`: a bare `printer.local`, and an
+//! address immediately followed by a dotted name — `10.1.2.3.acme.local`
+//! leaves `acme.local` behind, because the IP rule runs first and the
+//! remaining two labels then look like a filename.
+//!
+//! # This rule is a prior, not a classifier
+//!
+//! A hostname and a reverse-DNS identifier are the same string in opposite
+//! orders, and no context-free test over a dotted token settles which is
+//! which. Case is a convention Java breaks with `com.foo.internal.impl` and
+//! DNS breaks with `SERVER01.CORP`; suffix membership flips the moment `.app`
+//! and `.dev` become both gTLDs and bundle-id endings.
+//!
+//! So every constant above is a prior tuned against the cases someone has
+//! thought of, and the numbered decisions in [`mask_hosts`] are the order
+//! those priors are applied in. Five rewrites in one sitting each fixed the
+//! previous round's defect and opened another one next door — the history is
+//! in `docs/testing.md`, and the honest reading of it is that this shape has
+//! run out of discriminating power rather than that the last exception has
+//! been found.
+//!
+//! What replaces it is context: mask what appears in host *position* — after
+//! `resolve`, `connect to`, `://`, `@`, `host=` — and, for structured records,
+//! use the field name, which this crate already knows and currently throws
+//! away before scrubbing. Tracked as its own change rather than a sixth patch.
 //!
 //! Free-form user prose. If your reporter types their employer's name into the
 //! description field, that is their disclosure to make — the crate's job is to
@@ -941,15 +963,17 @@ const COMPOUND_SUFFIXES: &[&str] = &[
 /// round trip, a published hostname does not come back.
 const REVERSE_DNS_ROOTS: &[&str] = &["com", "org", "net", "edu", "gov", "mil", "int", "io", "dev"];
 
-/// Private suffixes that are also ordinary words, and so collide with real
-/// filenames: `.env.local`, `settings.local`, `keys.private`, `config.local`.
+/// The one private suffix that is also a real filename extension:
+/// `.env.local`, `settings.local`, `config.local`.
 ///
-/// Only these get the two-label relaxation. There is no `settings.corp` or
-/// `keys.intranet`, so `corp`, `internal`, `intranet`, `lan`, `home`, `priv`
-/// and `arpa` are masked at two labels like any other — relaxing them
-/// uniformly leaked `bastion.corp` and `vault.internal`, which are exactly the
-/// names the rule exists for.
-const WORDLIKE_PRIVATE_SUFFIXES: &[&str] = &["local", "private"];
+/// Only this one gets the two-label relaxation, and the list is deliberately
+/// as short as the evidence supports. Every entry here is a hole — `X.local`
+/// at two labels is kept unless `X` looks like a machine — so `private` was
+/// removed once it became clear that `keys.private` is a contrivance while
+/// `.env.local` is in every project. There is no `settings.corp` either:
+/// relaxing the private suffixes uniformly leaked `bastion.corp` and
+/// `vault.internal`, which are exactly the names the rule exists for.
+const WORDLIKE_PRIVATE_SUFFIXES: &[&str] = &["local"];
 
 /// Whether a label looks like it names a machine rather than a word.
 ///
@@ -1679,14 +1703,18 @@ mod tests {
 
     #[test]
     fn a_dotfile_is_not_a_machine_on_the_local_network() {
-        // `local`, `home`, `private` are English words as well as private
-        // suffixes, and `.env.local` is in every Vite, Next and Django project
-        // there is. Two labels alone is not enough to call something a host.
+        // `local` is a filename extension as well as a private suffix, and
+        // `.env.local` is in every Vite, Next and Django project there is. Two
+        // labels alone is not enough to call something a host.
+        //
+        // Only `local`. Every entry in `WORDLIKE_PRIVATE_SUFFIXES` is a hole,
+        // so the list is as short as the evidence supports: `keys.private` is
+        // a contrivance and `safe.private` is a machine, so `private` is not
+        // on it.
         let redactor = redactor();
         for input in [
             "cannot read .env.local",
             "settings.local missing",
-            "keys.private not found",
             "loading config.local",
         ] {
             assert_eq!(redactor.scrub(input), input, "mangled a filename");
