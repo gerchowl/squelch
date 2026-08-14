@@ -75,10 +75,22 @@
 //! anything else — relaxing every private suffix uniformly leaked exactly the
 //! names the rule exists for.
 //!
-//! The trade runs the other way too. A three-label filename ending in a
-//! private suffix — `docker-compose.override.local` — is masked, because at
-//! three labels the shape really is a hostname's. A filename costs a round
-//! trip; a hostname does not come back.
+//! The trade runs the other way too, and two losses are accepted on purpose:
+//!
+//! - A three-label filename ending in a private suffix —
+//!   `docker-compose.override.local` — is masked, because at three labels the
+//!   shape really is a hostname's.
+//! - A module path from an ecosystem that does *not* use reverse-DNS, with a
+//!   private-suffix word in the middle — `myapp.internal.helpers` — is masked.
+//!   It is indistinguishable from `bastion.corp.acme-inc`, and only one of the
+//!   two is recoverable when the rule guesses wrong.
+//!
+//! A filename or a frame costs a round trip; a hostname does not come back.
+//!
+//! One known leak, kept because the fix endangers a common case: an address
+//! immediately followed by a dotted name — `10.1.2.3.acme.local` — leaves
+//! `acme.local` behind, because the IP rule runs first and the remaining two
+//! labels then look like `.env.local`.
 //!
 //! Free-form user prose. If your reporter types their employer's name into the
 //! description field, that is their disclosure to make — the crate's job is to
@@ -972,17 +984,14 @@ fn mask_hosts(text: &str) -> String {
                 return keep();
             };
 
-            // A reverse-DNS identifier begins with the suffix a hostname ends
-            // with. Decided first, because the private-suffix rules below must
-            // not fire on `com.foo.internal.Impl`.
-            let starts_with_a_suffix = labels
-                .first()
-                .is_some_and(|first| is(first, HOST_SUFFIXES) || is(first, PRIVATE_SUFFIXES));
-            if starts_with_a_suffix {
-                return keep();
-            }
-
-            // A private suffix in the last position.
+            // The order below IS the rule. Each of the three preceding rounds
+            // on this function got it wrong by testing the right things in the
+            // wrong sequence.
+            //
+            // 1. A private suffix at the END settles it: `int.acme.corp` is a
+            //    host whatever it begins with. Checking the reverse-DNS escape
+            //    first gave a free pass to any host whose first label happened
+            //    to be a TLD.
             if is(last, PRIVATE_SUFFIXES) {
                 // Two labels is enough unless the suffix is also a word, in
                 // which case the name has to look like a machine — see
@@ -995,15 +1004,39 @@ fn mask_hosts(text: &str) -> String {
                 };
             }
 
-            // A private label MID-RUN, in a run that is entirely lowercase.
-            // `bastion.corp.acme-inc` is corporate DNS with no public suffix at
-            // the end, and requiring one let every such name through. The
-            // package paths that share the shape carry a capital — a class
-            // name — or begin with a suffix, which is already handled above.
-            if labels.iter().any(|label| is(label, PRIVATE_SUFFIXES))
-                && !found.chars().any(|c| c.is_ascii_uppercase())
+            // 2. A CamelCase LAST label is a class name, so the run is a
+            //    package path. "Contains an uppercase letter anywhere" was
+            //    standing in for this and is not the same test: Windows and AD
+            //    hostnames are routinely capitalised, so it switched the rule
+            //    off on exactly the hosts it exists for.
+            if last.starts_with(|c: char| c.is_ascii_uppercase()) {
+                return keep();
+            }
+
+            // 3. A private label MID-RUN, in a run that ends in neither a
+            //    private nor a public suffix: `bastion.corp.acme-inc`, an
+            //    internal root with no public TLD. Requiring a known final
+            //    label let every one of those through.
+            //
+            //    The exception is a genuine reverse-DNS package —
+            //    `com.acme.internal.util` — which begins with a suffix and
+            //    contains no label shaped like a machine. A hyphen or a digit
+            //    in there means `io.corp.acme-inc`, not `io.netty.internal`.
+            if labels.iter().any(|label| is(label, PRIVATE_SUFFIXES)) {
+                let reverse_dns = labels
+                    .first()
+                    .is_some_and(|first| is(first, HOST_SUFFIXES) || is(first, PRIVATE_SUFFIXES))
+                    && !labels.iter().any(|label| looks_like_a_machine(label));
+                return if reverse_dns { keep() } else { mask() };
+            }
+
+            // 4. A reverse-DNS identifier begins with the suffix a hostname
+            //    ends with: `com.example.app` against `bastion.corp.acme.com`.
+            if labels
+                .first()
+                .is_some_and(|first| is(first, HOST_SUFFIXES) || is(first, PRIVATE_SUFFIXES))
             {
-                return mask();
+                return keep();
             }
 
             // Otherwise it has to end in a public suffix to be a host at all.
@@ -1668,6 +1701,43 @@ mod tests {
         ] {
             assert_eq!(redactor.scrub(input), input, "mangled a package path");
         }
+    }
+
+    #[test]
+    fn a_capital_anywhere_does_not_make_a_host_a_class_name() {
+        // "contains an uppercase letter" was standing in for "is a class
+        // name", and one capital anywhere disabled the rule. Windows and AD
+        // hostnames are routinely capitalised, so it disabled it on exactly
+        // the hosts it exists for. What actually marks a package path is the
+        // LAST label being a class name.
+        let redactor = redactor();
+        for (input, secret) in [
+            ("resolve Bastion.internal.acme-inc failed", "acme-inc"),
+            ("resolve Server01.corp.acme-inc failed", "Server01"),
+            ("resolve BASTION.CORP.acme-inc failed", "acme-inc"),
+        ] {
+            assert_gone(&redactor, input, secret);
+        }
+    }
+
+    #[test]
+    fn a_leading_suffix_does_not_excuse_a_private_root() {
+        // The reverse-DNS escape hatch was checked before the suffix at the
+        // end, so any host whose first label happened to be a TLD got a free
+        // pass — including `int.acme.corp`, which ends in a private suffix and
+        // is unambiguously a host.
+        let redactor = redactor();
+        for (input, secret) in [
+            ("resolve int.acme.corp failed", "acme"),
+            ("resolve io.corp.acme-inc failed", "acme-inc"),
+        ] {
+            assert_gone(&redactor, input, secret);
+        }
+        // …and the reverse-DNS packages it is there for still survive.
+        assert_eq!(
+            redactor.scrub("at com.acme.internal.util"),
+            "at com.acme.internal.util"
+        );
     }
 
     #[test]
