@@ -102,7 +102,7 @@
 //! and `.dev` become both gTLDs and bundle-id endings.
 //!
 //! So every constant above is a prior tuned against the cases someone has
-//! thought of, and the numbered decisions in [`mask_hosts`] are the order
+//! thought of, and the numbered decisions in `mask_hosts` are the order
 //! those priors are applied in. Five rewrites in one sitting each fixed the
 //! previous round's defect and opened another one next door — the history is
 //! in `docs/testing.md`, and the honest reading of it is that this shape has
