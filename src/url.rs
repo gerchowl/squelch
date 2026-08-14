@@ -26,6 +26,8 @@ pub const MAX_URL_LEN: usize = 7_500;
 /// A built URL, and whether anything was lost building it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrefilledUrl {
+    /// The URL itself. Safe to hand to a platform opener only after
+    /// [`is_safe_to_open`].
     pub url: String,
     /// Fields whose value was cut short to fit, in the order they were given.
     ///
@@ -119,7 +121,13 @@ fn truncate_encoded(encoded: &str, room: usize) -> String {
     let mut cut = encoded.len().min(room);
     let bytes = encoded.as_bytes();
     while cut > 0 {
-        let tail = &bytes[cut.saturating_sub(2)..cut];
+        // `get` rather than an index: `cut` is derived from `encoded.len()`
+        // so the range is always valid, but a panic here would fire while
+        // building a bug report, which is the worst possible moment for the
+        // tool to crash a second time.
+        let Some(tail) = bytes.get(cut.saturating_sub(2)..cut) else {
+            break;
+        };
         if tail.contains(&b'%') {
             cut -= 1;
         } else {

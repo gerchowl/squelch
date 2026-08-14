@@ -5,13 +5,20 @@ already on a public tracker. So the test suite is built to answer one question �
 **what actually left the machine?** — rather than to check that the builder
 returns the right struct.
 
-## Three layers
+## Four layers
 
 | layer | where | what it can catch |
 | --- | --- | --- |
 | unit | `src/**` inline `mod tests` | rule-level behaviour: a regex, a parser, a cap |
+| property | `tests/observability_closure.rs` | the *shape* of a defect, not an instance of it |
 | end-to-end | `apps/squelch-demo/tests/` | what a receiver got, across a crate and a process boundary |
-| build matrix | `nix flake check` | what a *consumer* gets: feature combinations, both platforms |
+| build matrix | `nix flake check` | what a *consumer* gets: feature combinations, both platforms, the MSRV, the supply chain |
+
+`tests/issue_form.rs` sits outside that table because it asserts a property of
+the **repository** rather than of the crate: that the field ids this repo's own
+examples prefill are declared by the issue form this repo ships. It is excluded
+from the published crate for that reason — unpacked from a `.crate` it would
+only panic on a missing file.
 
 ## Why the demo app is a workspace member
 
@@ -52,8 +59,10 @@ into an unreadable abort.
 `common/mod.rs` holds values that must never reach a receiver — a token, another
 account's home, an email, a private IPv4, a compressed IPv6, an internal FQDN, a
 private org, a labelled secret, an AWS session key, a Stripe key, a bearer
-token, a zero-width-split credential — planted in log fields *and* in
-provenance, then asserted absent from every payload.
+token, a zero-width-split credential, private-key armour, a forge URL with no
+`.git`, Google/Slack/Telegram tokens, a driveless Windows path, a UNC share, a
+MAC address — planted in log fields *and* in provenance, then asserted absent
+from every payload.
 
 Two properties keep it from going vacuous:
 
@@ -61,7 +70,98 @@ Two properties keep it from going vacuous:
   the raw material. A corpus that lost a canary would make every leak assertion
   pass for the wrong reason.
 - `SURVIVORS` pins text that must **survive**. Over-masking makes the block
-  worthless just as surely as under-masking makes it dangerous.
+  worthless just as surely as under-masking makes it dangerous — and the
+  clearest case is a stack frame, which is the single most useful line in a bug
+  report. `django.contrib.auth.models` has exactly the shape of a hostname, and
+  the FQDN rule was eating every Python, Java and Kotlin frame until the corpus
+  said it must not.
+
+A leak assertion on a route that carries nothing passes for the wrong reason, so
+each e2e test asserts **presence before absence**. The mailto route spent a
+while sending an empty draft while `the_mailto_url_carries_no_canary` stayed
+green: a route that transmits nothing leaks nothing.
+
+## Properties, where examples run out
+
+Every defect the first two review rounds found was found by a person reading
+code. The tests added alongside each fix pin the input that broke; none of them
+would catch the *next* value of the same shape. `tests/observability_closure.rs`
+asserts the shape instead, over generated sequences of builder operations:
+
+| property | what it forbids |
+| --- | --- |
+| idempotence | adopt-style state (`field`, `label`, `require`, `form`, `provenance`) stored in an append-only `Vec`, so applying an operation twice is observable |
+| conservation | a lossy encoder reporting less loss than it caused — everything absent or truncated in the URL is named in `shortened`/`dropped`, and nothing named survived intact |
+| round-trip | `skeleton` → `parse_skeleton` losing an answer because the reporter's own text imitated a delimiter |
+
+### A property can pass while asserting nothing
+
+The first version of this suite was reviewed by an agent that instrumented it
+and counted branch hits. The result was worth more than any finding: over 447
+generated cases, the assertion the whole property exists for — *a field vanished
+from the URL and nothing named it* — **ran zero times**. Arbitrary builder
+operations almost never produce values that compete for a 7 500-character
+budget, so the branch was unreachable in practice while the test reported
+success.
+
+That is worse than having no test, because it is counted as coverage.
+
+Two things fix it, and both are needed:
+
+- The generated sequence always ends with two to four fields whose combined
+  length straddles the budget, so truncation and dropping are the common case
+  rather than the vanishing one. The drop branch now runs about 140 times a run.
+- A **coverage assertion** fails the suite if answers plainly exceeding the
+  budget produce a manifest reporting no loss at all — so the generators cannot
+  quietly drift back to producing values too small to reach it.
+
+The same review found the property was reading only the URL, despite a docstring
+promising closure between body, URL and manifest. A `render_body` regression
+that dropped a section would have passed.
+
+Three rules keep it honest:
+
+- **The oracle is written from the contract, not from `url::build`.** A shadow
+  model that reimplements the code agrees with the code's bugs, so
+  `carries_whole_value` percent-decodes the parameter back rather than calling
+  the encoder.
+- **`diagnostics` is excluded from the idempotence property**, because it
+  genuinely is not idempotent — two independent sources of the same warning must
+  both survive. Encoding which operations are adopt-style is the point; if the
+  property had been weakened instead, it would have stopped asserting anything.
+- **Generators are biased toward the 7 500-character URL budget** rather than
+  sampled uniformly, or the boundary where truncation and dropping happen is
+  essentially never reached.
+
+It found three defects on its first run, all silent: a markdown heading in an
+answer read as structure, an HTML comment in an answer deleted as guidance, and
+an empty `Provenance` overwriting the reporter's own words with nothing.
+
+Verified load-bearing by mutation, in a *copy* of the repo: reinstating the
+append-only `require`, the empty overwrite, an unreported dropped field and the
+blanket comment strip fails four different properties.
+
+## The MSRV is built, not asserted
+
+`checks.msrv` builds `-p squelch --all-features` with exactly the compiler
+`rust-version` names, using a second toolchain pin in `.msrv/rust-toolchain.toml`.
+Every other check is off there: running clippy or the test suite on an old
+compiler measures the compiler, not the crate, and a lint that did not exist yet
+says nothing about whether a consumer pinned there can build this.
+
+It earned its place on its first run. `rust-version` said `1.74`, verified by
+nothing, and 1.74 cannot build this crate at all — a transitive dependency is
+edition 2024, which that Cargo cannot parse. A declared-but-unverified MSRV is a
+*false* promise rather than a weak one: the suite stays green and the failure
+lands on a downstream who cannot tell it from their own mistake.
+
+## Supply chain
+
+`deny.toml` turns on `cargo deny check` — advisories, licences, bans, sources.
+`openssl`, `openssl-sys` and `native-tls` are banned outright rather than merely
+not selected: `ureq` is configured for rustls, and if those feature flags ever
+drift, a C TLS stack lands in every consumer's binary. Policy fails the build;
+a line in `Cargo.toml` only fails to prevent it.
 
 ## Feature matrix
 
@@ -75,7 +175,7 @@ shipped unable to compile without `logs` while every other check was green.
 
 ```sh
 cargo test --workspace --all-features    # fast loop
-nix flake check                          # what CI runs: 7 checks
+nix flake check                          # what CI runs: 9 checks
 ```
 
 ### On macOS, failures may be unreadable
@@ -99,6 +199,34 @@ linker, `xdg-open` instead of `open`, and the `libc` `getpwuid` fallback that
 keeps the redactor working when a service manager strips `HOME` and `USER`.
 
 ```sh
-rsync -az --delete --exclude target/ ./ <linux-host>:~/squelch-ci/
-ssh <linux-host> 'cd ~/squelch-ci && nix flake check'
+ssh <linux-host> 'rm -rf ~/ci/squelch/.git'          # see below
+rsync -az --delete --exclude 'target/' --exclude '.git/' ./ <linux-host>:~/ci/squelch/
+ssh <linux-host> 'cd ~/ci/squelch && nix flake check'
 ```
+
+**Delete `.git` on the far side, and mean it.** `--exclude '.git/'` tells rsync
+to ignore that directory on *both* ends, so `--delete` will not remove a stale
+one left by an earlier sync — and nix, finding a git repository, then builds
+from its **index** rather than from the files on disk. The check runs against
+whatever was tracked whenever that `.git` was copied, and says nothing about
+what you just wrote.
+
+**A second `mkRustProject` call is a second source filter.** The MSRV check is
+its own project, with its own `cleanSrc` — so `extraSrcFiles` passed to the main
+one does not reach it, and crane's `buildPackage` runs `cargo test` in its check
+phase regardless of `nextest = false`. The result was a suite that compiled
+locally and failed to compile in the sandbox, on a file the *other* project had
+been told about. Both calls now `inherit extraSrcFiles` from one binding, which
+is the only version of this that cannot drift.
+
+**A fixture read at run time is not a fixture.** `std::fs` plus
+`CARGO_MANIFEST_DIR` looks equivalent to `include_str!` and is not: it needs the
+source tree to still be where it was when the binary was built, which under
+`nix flake check` it is not. `tests/issue_form.rs` failed on Linux and passed on
+macOS for exactly this reason, and the failure read as a broken test rather than
+as an environment difference. `include_str!` also makes a missing fixture a
+*compile* error, so a test cannot quietly stop asserting anything.
+
+`nix flake check | tail` is the same class of mistake in one line: the pipe
+reports `tail`'s exit status, so a failing check reads as a passing one. Redirect
+to a file and check `$?`.

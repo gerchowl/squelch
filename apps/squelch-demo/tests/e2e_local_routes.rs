@@ -42,7 +42,7 @@ fn the_written_file_carries_no_canary_and_stays_diagnostic() {
 }
 
 #[test]
-fn the_mailto_url_carries_no_canary() {
+fn the_mailto_url_carries_the_report_and_no_canary() {
     let dir = scratch("mailto");
 
     let (ok, stdout, stderr) = compose(&dir, &["mailto", "bugs@example.com"]);
@@ -54,7 +54,18 @@ fn the_mailto_url_carries_no_canary() {
 
     // Percent-encoding is not redaction: decode before asserting, or a leaked
     // `/home/alice` hides behind `%2Fhome%2Falice` and the test passes.
-    assert_nothing_leaked("the mailto URL", &percent_decode(&stdout));
+    let decoded = percent_decode(&stdout);
+    assert_nothing_leaked("the mailto URL", &decoded);
+
+    // The leak assertion above passes trivially on an EMPTY draft, and for a
+    // while that is exactly what this route produced. A route that carries
+    // nothing leaks nothing. Assert presence first, or the absence assertion
+    // is measuring a route that does not work.
+    assert!(
+        decoded.contains("every git operation fails"),
+        "the reporter's own words must reach the mail draft: {decoded}"
+    );
+    assert_still_diagnostic("the mailto URL", &decoded);
 }
 
 #[test]

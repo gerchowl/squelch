@@ -10,7 +10,7 @@
 //!
 //! So each fake receiver captures the real payload and the tests assert on
 //! that: the URL `open` was handed, the argv `gh` was called with, the bytes
-//! POSTed to the endpoint.
+//! `POST`ed to the endpoint.
 //!
 //! # No new dependencies
 //!
@@ -19,7 +19,12 @@
 //! `nix flake check`, whose sandbox has loopback but no network and no
 //! container runtime.
 
-#![allow(dead_code)] // each test binary uses a different subset
+#![allow(dead_code)]
+// each test binary uses a different subset
+// `mod common;` is compiled separately into every test binary, so from any one
+// of them these items look unreachable. They are not: they are the shared
+// fixture surface, and the alternative is copying it per binary.
+#![allow(unreachable_pub)]
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
@@ -54,11 +59,36 @@ pub const CANARIES: &[(&str, &str)] = &[
     ("quoted secret tail", "hunter 2 stuff"),
     ("session cookie value", "s3ss10nvalueXYZ"),
     ("json-embedded token", "json_embedded_secret_v1"),
+    // Added after a second adversarial review pass. Each one leaked when
+    // written, and the first is the sharpest: the private-key rule matched
+    // nothing at all, because `(?x)` strips whitespace inside a character
+    // class and `[A-Z ]*` had compiled as `[A-Z]*`.
+    ("private key armour", "BEGIN OPENSSH PRIVATE KEY"),
+    ("forge url without .git", "prod-vault"),
+    ("google api key", "AIzaSyD-1234567890abcdefghijklmnopqrstu"),
+    ("slack app-level token", "xapp-1-A00000000-1234567890"),
+    ("telegram bot token", "AAG1234567890abcdefghijklmnopqrstuv"),
+    // The account name, not the path shape: the corpus carries this inside a
+    // JSON string, where the separators are escaped, and a needle with a
+    // backslash in it would never be found by the vacuity check.
+    ("driveless windows account", "bobtestuser"),
+    ("unc path", "fileserver"),
+    ("mac address", "aa-bb-cc-dd-ee-ff"),
 ];
 
 /// Text that must SURVIVE. Over-masking makes the block worthless just as
 /// surely as under-masking makes it dangerous, so the corpus pins both ends.
-pub const SURVIVORS: &[&str] = &["No such file or directory (os error 2)"];
+pub const SURVIVORS: &[&str] = &[
+    "No such file or directory (os error 2)",
+    // A stack frame is the single most useful line in a bug report, and the
+    // FQDN rule was eating every one of them: a dotted lowercase run is the
+    // shape of a hostname AND of a Python, Java or Kotlin module path.
+    "django.contrib.auth.models",
+    "org.jetbrains.kotlin.compiler",
+    // The tilde-home rule had no left boundary, so every revision in a pasted
+    // git command came out as `HEAD<path>`.
+    "HEAD~1",
+];
 
 /// A JSONL log corpus with a canary in every position that matters:
 /// in scrubbed fields (`message`, `err`), where the value rules must catch it;
@@ -90,6 +120,23 @@ pub fn canary_logs() -> String {
         // and renders as nothing, so a human reviewing the preview saw an
         // intact token and no reason to object.
         &format!(r#"{{"timestamp":"2026-08-12T09:00:12Z","level":"error","event":"zw","message":"using ghp_ZeroWidth{}SplitTokenAbcdefghij now"}}"#, "\u{200b}"),
+        // The armour rule matched nothing any tool emits, so the base64 body
+        // after it — which matches no other rule either — was publishable in
+        // full.
+        r#"{"timestamp":"2026-08-12T09:00:15Z","level":"error","event":"key","message":"failed to parse -----BEGIN OPENSSH PRIVATE KEY----- block"}"#,
+        // The forge rule wanted a trailing `.git`, which is the one form a
+        // human reading git's own error never sees.
+        r#"{"timestamp":"2026-08-12T09:00:16Z","level":"error","event":"git","message":"repository 'https://github.com/acmecorp/prod-vault/' not found"}"#,
+        r#"{"timestamp":"2026-08-12T09:00:17Z","level":"error","event":"gcp","message":"key AIzaSyD-1234567890abcdefghijklmnopqrstu rejected"}"#,
+        r#"{"timestamp":"2026-08-12T09:00:18Z","level":"error","event":"slack","message":"xapp-1-A00000000-1234567890-abcdefabcdefabcdef expired"}"#,
+        r#"{"timestamp":"2026-08-12T09:00:19Z","level":"error","event":"tg","message":"bot 123456789:AAG1234567890abcdefghijklmnopqrstuv unauthorized"}"#,
+        r#"{"timestamp":"2026-08-12T09:00:20Z","level":"error","event":"fs","message":"cannot open Users\\bobtestuser\\Documents\\notes.txt or \\\\fileserver\\share\\q.docx"}"#,
+        r#"{"timestamp":"2026-08-12T09:00:21Z","level":"error","event":"net","message":"iface aa-bb-cc-dd-ee-ff down"}"#,
+        // The survivors. A block scrubbed into uselessness costs the
+        // maintainer the same round trip as no block at all, so the corpus
+        // pins both ends of the rule.
+        r#"{"timestamp":"2026-08-12T09:00:22Z","level":"error","event":"trace","message":"at django.contrib.auth.models.User.save and org.jetbrains.kotlin.compiler.plugin"}"#,
+        r#"{"timestamp":"2026-08-12T09:00:23Z","level":"info","event":"git","message":"ran git reset --hard HEAD~1"}"#,
     ]
     .join("\n")
 }

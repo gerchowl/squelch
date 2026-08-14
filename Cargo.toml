@@ -5,18 +5,75 @@
 [workspace]
 members = ["apps/squelch-demo"]
 
+# One lint policy for the workspace, inherited by every member via
+# `lints.workspace = true`. In `Cargo.toml` rather than `#![warn(...)]` in
+# `lib.rs` because attributes in the crate root do not reach the demo app, the
+# examples or the integration tests — which is where a consumer's code shape
+# actually lives, and where a footgun would first show up.
+#
+# The `[lints]` table needs Cargo 1.74; this crate's verified MSRV is well
+# above that, so it costs nothing.
+[workspace.lints.rust]
+# `deny`, not `forbid`. This crate does contain exactly one `unsafe` block —
+# the `getpwuid` call the scrubber falls back to when a service manager has
+# stripped HOME and USER — and `forbid` cannot be lifted at the site, so it
+# would force the policy to be dropped instead of narrowed. `deny` plus one
+# `#[allow]` carrying the safety argument says what is actually true: unsafe is
+# banned here except where it is written down and justified.
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+# Every public item, on a crate whose reason to exist is that the maintainer on
+# the other end can act on what arrives. An undocumented `pub` field is a
+# question a consumer has to answer by reading the source.
+missing_docs = "warn"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+todo = "deny"
+dbg_macro = "deny"
+doc_markdown = "warn"
+# Deliberately NOT here: `expect_used`, `panic`, `print_stdout`. Each fires
+# dozens of times on code that is right — `OnceLock` regex compiles that cannot
+# fail, a demo CLI whose whole job is to print. A policy that warns constantly
+# is a policy nobody reads, and the one real signal drowns. The panic-path
+# lints that do earn their place are set on the library crate alone, where
+# `cfg(test)` can be excluded; see `lib.rs`.
+
 [package]
 name = "squelch"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.74"
+# Verified, not asserted: `checks.msrv` in flake.nix builds the crate with
+# exactly this compiler on every run. It said 1.74 before anything checked, and
+# 1.74 could not build this crate at all — `endpoint` pulls ureq → url → idna →
+# idna_adapter, which is edition 2024, so a Cargo older than 1.85 cannot even
+# parse the manifest. A declared-but-unverified MSRV is a FALSE promise rather
+# than a weak one: the build stays green while the failure lands on a
+# downstream who has no way to tell it from their own mistake.
+#
+# The number is set by the dependency tree, not by squelch's own source, which
+# uses nothing newer than the 2021 edition. A consumer on `default-features =
+# false` almost certainly builds on something much older — but the crate does
+# not promise what it does not verify, and there is one lockfile here, so there
+# is one number.
+#
+# Raising this is a breaking change. `.msrv/rust-toolchain.toml` is the other
+# half; the two must move together.
+rust-version = "1.86"
 description = "Let your users file a genuinely useful bug report: collect environment, redact the logs, open a prefilled GitHub issue form"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/gerchowl/squelch"
 keywords = ["bug-report", "issue", "redaction", "github", "diagnostics"]
 categories = ["command-line-interface", "development-tools::debugging"]
 readme = "README.md"
-exclude = ["/.github", "/target"]
+# `/.github` is repository furniture, not crate content — but `tests/issue_form.rs`
+# reads it, so that test has to leave with it. It asserts a property of the
+# *repository* (the ids this repo's own examples prefill are declared by the
+# issue form this repo ships), which is meaningless once unpacked from a
+# .crate. Publishing it would hand every downstream a test that panics on a
+# missing file.
+exclude = ["/.github", "/target", "/tests/issue_form.rs"]
 
 [features]
 default = ["browser", "logs"]
@@ -47,6 +104,9 @@ schema = ["dep:serde_json"]
 # dependency of its own; you bring the deserializer.
 serde = ["dep:serde"]
 
+[lints]
+workspace = true
+
 [dependencies]
 # The scrubber's rules. The one unconditional dependency: redaction is the
 # reason this crate exists, so it is not behind a feature flag.
@@ -66,7 +126,27 @@ ureq = { version = "2", optional = true, default-features = false, features = ["
 libc = "0.2"
 
 [dev-dependencies]
+# Property tests for observability closure (#3). Every defect #2 fixed was
+# found by a person reading code, not by a test — the tests added there pin the
+# inputs that broke and would not catch the next instance of the same shape.
+# `tests/observability_closure.rs` asserts the shape instead.
+proptest = "1"
 serde_json = "1"
+# A YAML parser, in dev only, so `tests/issue_form.rs` can run this repo's own
+# `.github/ISSUE_TEMPLATE/bug.yml` through `form::github::IssueForm`. The
+# crate's headline claim about the form model is that you can deserialize it
+# from the YAML you already keep in `.github/ISSUE_TEMPLATE/` — and until this
+# test, nothing checked that against real YAML. The only coverage was one
+# hand-written JSON blob, which exercises serde's derive and none of GitHub's
+# actual syntax.
+#
+# `serde_yaml_ng` rather than `serde_yaml`: the latter has been archived
+# unmaintained since 2024, and `deny.toml` would rightly refuse it.
+#
+# A dev-dependency, so no consumer inherits it, and no feature of the published
+# crate can reach it. `cargo hack --feature-powerset --no-dev-deps` (a flake
+# check) is what proves that rather than assumes it.
+serde_yaml_ng = "0.10"
 
 [[example]]
 name = "file_a_bug"

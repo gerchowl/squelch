@@ -231,12 +231,21 @@ impl Report {
             // last value, the reporter's own words were overwritten by the
             // environment block the moment the form opened. `environment` is a
             // common field id, so a form declaring one collided by default.
+            let rendered = provenance.to_markdown();
             match values
                 .iter_mut()
                 .find(|(id, _)| *id == self.provenance_field)
             {
-                Some((_, slot)) => *slot = provenance.to_markdown(),
-                None => values.push((self.provenance_field.as_str(), provenance.to_markdown())),
+                // …but never replace something with nothing. A `Provenance`
+                // that collected no entries renders empty, and overwriting a
+                // reporter's own words with it deleted them — the field then
+                // carried no value, so it never reached the URL and nothing
+                // named it as dropped. Replacing an answer with a better one
+                // is the documented behaviour; replacing it with silence is
+                // not a version of that.
+                Some((_, slot)) if !rendered.trim().is_empty() => *slot = rendered,
+                Some(_) => {}
+                None => values.push((self.provenance_field.as_str(), rendered)),
             }
         }
 
@@ -340,11 +349,17 @@ impl Report {
                 // a URL whose FIRST `?` belongs to the attacker, so a mail
                 // client splitting there prefills their body and drops the
                 // report entirely.
+                // `composed.body` and not a subset: mail is a body route.
+                // README and `Error::FieldsDropped` both point a reporter
+                // whose report was too long for the browser link at "a file,
+                // mail, `gh`, or your endpoint", so this one has to carry the
+                // whole thing — diagnostics included — or that advice is a
+                // dead end.
                 Ok(Sent::Mailto(format!(
                     "mailto:{}?subject={}&body={}",
                     percent_address(to),
                     percent(&subject),
-                    percent("")
+                    percent(&composed.body)
                 )))
             }
             Transport::File(path) => {
@@ -418,8 +433,11 @@ impl Report {
 /// An assembled report.
 #[derive(Debug, Clone)]
 pub struct Composed {
+    /// Where it is addressed.
     pub destination: Destination,
+    /// The issue title, for routes that carry one separately from the form.
     pub title: Option<String>,
+    /// The prefilled form URL, and an account of anything it could not carry.
     pub url: PrefilledUrl,
     /// The full markdown body, for routes that carry one.
     pub body: String,
@@ -433,17 +451,27 @@ pub struct Composed {
 pub enum Sent {
     /// The browser was opened. `diagnostics` still needs pasting by the human.
     Opened {
+        /// What the browser was handed.
         url: String,
+        /// The block the URL deliberately does not carry, for the reporter to
+        /// paste into the open form.
         diagnostics: Option<String>,
     },
     /// Built but not opened — the `browser` feature is off.
     Prepared {
+        /// Ready for whatever you use to open it.
         url: String,
+        /// As for [`Sent::Opened`].
         diagnostics: Option<String>,
     },
+    /// A `mailto:` URL carrying the whole report, for the reporter's mail
+    /// client. Nothing has been sent: they still press Send.
     Mailto(String),
+    /// The report was written here, and nothing left the machine.
     Written(std::path::PathBuf),
+    /// `gh` created the issue. The URL it printed.
     Created(String),
+    /// Your endpoint accepted the report. Whatever it answered with.
     Posted(String),
 }
 
@@ -581,7 +609,42 @@ mod tests {
             Sent::Mailto(url) => {
                 assert!(url.starts_with("mailto:bugs@example.com?"));
                 assert!(url.contains("subject=crash%20on%20split"));
+                // The whole point of the route. This test was named
+                // `..._encodes_the_body` while asserting only the subject, so
+                // when the body was replaced with `percent("")` in a stray
+                // edit it stayed green — a draft with an address, a subject,
+                // and nothing to send.
+                assert!(
+                    url.contains(&percent("it crashes")),
+                    "the composed body must be in the draft: {url}"
+                );
             }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn mailto_carries_the_whole_report_including_diagnostics() {
+        // README and `Error::FieldsDropped`'s own text both send a reporter
+        // whose report was too long for the browser link to "a file, mail,
+        // `gh`, or your endpoint" — the routes that carry it whole. Mail has
+        // to actually be one of those or that advice sends them nowhere.
+        let sent = report()
+            .diagnostics([Record {
+                timestamp: "2026-08-12T00:00:00Z".into(),
+                level: "error".into(),
+                source: None,
+                fields: vec![("message".into(), "zzmarkerzz".into())],
+            }])
+            .via(Transport::Mailto("bugs@example.com".into()))
+            .send()
+            .unwrap();
+        match sent {
+            Sent::Mailto(url) => assert!(
+                url.contains(&percent("zzmarkerzz")),
+                "diagnostics are excluded from the GitHub URL by design, but \
+                 mail is a body route and carries them: {url}"
+            ),
             other => panic!("{other:?}"),
         }
     }

@@ -1,0 +1,92 @@
+name: Bug report
+description: Something squelch does wrong, or does not do.
+title: "bug: "
+labels: ["bug"]
+
+# The form squelch's own examples, doctests and demo app prefill.
+#
+# Every `template("bug.yml")` in this repo resolves HERE, and a prefilled URL
+# only lands its answers when the query parameter matches a field `id` below.
+# So the ids in this file are an API surface, not a presentation choice:
+# renaming one silently empties that section of every report the crate has
+# ever taught a consumer to send. `tests/issue_form.rs` fails if the code and
+# this file disagree about the set.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. If you arrived here from a prefilled link, the
+        answers below are already filled in — read them before submitting, and
+        delete anything you would rather not make public. Nothing has been
+        sent yet.
+
+  - type: textarea
+    id: current-behavior
+    attributes:
+      label: Current behavior
+      description: What happens now?
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected-behavior
+    attributes:
+      label: Expected behavior
+      description: What did you expect instead?
+    validations:
+      required: false
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: The steps that trigger it. A failing snippet beats a description.
+    validations:
+      required: true
+
+  - type: textarea
+    id: impact
+    attributes:
+      label: Impact
+      description: What does this block, and is there a workaround?
+    validations:
+      required: false
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: >-
+        Filled in for you when you arrive from a prefilled link — versions,
+        build shape and platform, with paths and identifiers already scrubbed.
+        Fill it in by hand otherwise.
+      render: markdown
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: >-
+        A redacted log tail. squelch deliberately does NOT put this in the
+        prefilled URL — it prints it for you to review and paste, so a long log
+        cannot push your own words out of the form. Paste it here if you have
+        one.
+      render: text
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Confirmation
+      description: >-
+        No tool can tick these for you. Prefilling a checkbox is impossible on
+        GitHub, and squelch would refuse anyway: a confirmation is your
+        statement, not the machine's.
+      options:
+        - label: I can reproduce this
+          required: true
+        - label: I have read the answers above and am happy for them to be public
+          required: true

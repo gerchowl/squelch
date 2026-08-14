@@ -8,7 +8,14 @@
 //! # Allowlist, never denylist
 //!
 //! [`Redactor`] keeps an explicitly named set of structured fields and drops
-//! everything else **unread**. A denylist over a logging surface fails open the
+//! everything else **unread** — with two exceptions, `timestamp` and `level`,
+//! which are always extracted because a log line without them is not a log
+//! line. Both are scrubbed like any other value, and were the one hole in this
+//! promise: pulled out of the JSON and rendered verbatim, they published
+//! whatever a hostile emitter put in them while the allowlist protected every
+//! field except the two guaranteed to be present.
+//!
+//! A denylist over a logging surface fails open the
 //! moment someone adds an emitter, and nobody revisits a denylist when they add
 //! a field. With an allowlist, a new field is excluded by default and the worst
 //! case is a report that is less useful than it could be.
@@ -26,10 +33,34 @@
 //!   `_` is a word character and so there is no boundary before `token`
 //! - email addresses, `user@host` ssh targets, and git remotes with their org
 //!   and repository name
-//! - IPv4 and IPv6
-//! - hostnames under private suffixes, and any FQDN of three or more labels
+//! - IPv4, IPv6 and MAC addresses
+//! - hostnames under private suffixes, and FQDNs of three or more labels whose
+//!   final label is a real suffix
+//! - identifiers *labelled* as naming the machine — `machine-id`, `serial`,
+//!   `udid`, `imei`
 //!
 //! # What it deliberately does not cover
+//!
+//! **Encoded secrets.** A base64, hex or `\u`-escaped token matches nothing
+//! here. Decoding every candidate run to search inside it is a different tool
+//! with a different cost, and the decoded-and-re-encoded search space has no
+//! natural floor. What contains encoded credentials in practice is a JSON
+//! error body from a downstream service, and the labelled-secret rule catches
+//! those by their key rather than their contents.
+//!
+//! **Bare UUIDs.** Request ids, trace ids and span ids are UUIDs, and they are
+//! the thread a maintainer follows through a log. Masking them costs the
+//! report the one thing that makes it followable, for a machine id that is
+//! only a machine id when something says so — which is why the label, not the
+//! shape, is what fires the rule.
+//!
+//! **Hostnames on unusual suffixes.** The FQDN rule tests the final label
+//! against a list, because without one it cannot tell
+//! `bastion.corp.acme.com` from `django.contrib.auth.models` — they have the
+//! same shape, and masking the second cost a Django traceback the line that
+//! says where the bug is. A host under a suffix not on that list is not
+//! matched by *this* rule; the private-suffix, `user@host` and git-remote
+//! rules are what cover the shapes that carry a name in practice.
 //!
 //! Free-form user prose. If your reporter types their employer's name into the
 //! description field, that is their disclosure to make — the crate's job is to
@@ -82,7 +113,12 @@ const MAX_VALUE_CHARS: usize = 1_024;
 /// One log record reduced to what may be published.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Record {
+    /// When the line was emitted, scrubbed. Always extracted, because a log
+    /// line without one is not a log line — see the allowlist note in the
+    /// module docs.
     pub timestamp: String,
+    /// The severity the emitter gave it, scrubbed. Defaults to `INFO` when the
+    /// line carried none.
     pub level: String,
     /// Which file or stream this came from, when the caller tagged it.
     pub source: Option<String>,
@@ -281,15 +317,23 @@ impl Redactor {
         for (pattern, replacement) in [
             (git_remote_re(), "<git-remote>"),
             (secret_token_re(), "<redacted-token>"),
+            // Before `labeled_secret_re`, which would otherwise consume the
+            // `id=` and leave the identifier itself standing.
+            (machine_id_re(), "${1}${2}=<machine-id>"),
             (labeled_secret_re(), "${1}${2}${3}${4}=<redacted>"),
             (email_re(), "<email>"),
             (ssh_target_re(), "<ssh-target>"),
+            // Before the IPv6 rule, whose colon-run alternative would claim a
+            // colon-form MAC and report it as an address.
+            (mac_address_re(), "${1}<mac>${2}"),
             (ipv6_re(), "${1}<ip>${3}"),
             (ipv4_re(), "<ip>"),
-            (private_host_re(), "<host>"),
         ] {
             out = pattern.replace_all(&out, replacement).to_string();
         }
+        // Last, and not in the table above: the host rule needs the match in
+        // hand to decide, so it cannot be expressed as a replacement string.
+        out = mask_hosts(&out);
 
         for (token, host) in preserved {
             out = out.replace(&token, host);
@@ -303,7 +347,7 @@ impl Redactor {
             let bounded = Regex::new(&format!(r"{}(?:/|\b)", regex::escape(home)))
                 .expect("escaped home pattern");
             out = bounded
-                .replace_all(&out, |caps: &regex::Captures| {
+                .replace_all(&out, |caps: &regex::Captures<'_>| {
                     if caps[0].ends_with('/') {
                         "~/".to_string()
                     } else {
@@ -312,7 +356,11 @@ impl Redactor {
                 })
                 .to_string();
         }
-        out = home_path_re().replace_all(&out, "<path>").to_string();
+        // `${1}` restores the captured left delimiter. The tilde alternative
+        // needs one — with no boundary before `~`, every `HEAD~1` in a pasted
+        // git command became `HEAD<path>` — and this engine has no lookaround,
+        // so the delimiter is captured and put back rather than looked past.
+        out = home_path_re().replace_all(&out, "${1}<path>").to_string();
         if let Some(user) = &self.user {
             // Case-insensitive: logs and macOS paths preserve display case, so
             // `ATTACKER` and `Attacker` walked straight past a plain replace.
@@ -515,6 +563,10 @@ fn passwd_name() -> Option<String> {
     passwd_field(|entry| entry.pw_name)
 }
 
+/// The one `unsafe` block in the crate, which is why the workspace policy sets
+/// `unsafe_code = "deny"` rather than `forbid`: banned everywhere, allowed here,
+/// with the argument written down beside it.
+#[allow(unsafe_code)]
 #[cfg(unix)]
 fn passwd_field(select: fn(&libc::passwd) -> *mut libc::c_char) -> Option<String> {
     // SAFETY: getpwuid returns a pointer into a static buffer owned by libc, or
@@ -551,9 +603,29 @@ fn git_remote_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r"(?x)
+            // `(?i)`: a scheme is case-insensitive per RFC 3986, and `HTTPS://`
+            // is what a Windows shell and a good many log formatters emit. The
+            // rule was case-sensitive, so shifting two characters defeated it.
+            r"(?ix)
               \bgit@[A-Za-z0-9._\-]+:[^\s\x22]+
             | \bssh://[^\s\x22]+
+            # A named forge, with or without `.git`. Requiring the suffix meant
+            # the rule missed the form git itself prints — `fatal: repository
+            # 'https://github.com/acme/prod-vault/' not found` — and every URL
+            # a human pastes from a browser. The path is consumed to the end so
+            # `/pull/42` and `/-/tree/main` cannot leave a tail behind.
+            # The path class excludes `),;` so the rule cannot eat the
+            # punctuation after a URL and then the diagnosis that follows it.
+            | \bhttps?://(?:www\.)?(?:github|gitlab|bitbucket|codeberg)\.[a-z]+/[^\s\x22),;]*
+            # sourcehut is its own alternative because its host IS `sr.ht`:
+            # folded into the list above it required `sr.ht.<something>/`, which
+            # is not a host, so the branch could never match and every real
+            # sourcehut URL published its org and repository.
+            | \bhttps?://(?:git\.|hg\.)?sr\.ht/[^\s\x22),;]*
+            # Any other host, still requiring `.git`: without a known forge
+            # there is nothing to distinguish a repository URL from an ordinary
+            # link, and masking every URL in a log would take the diagnosis
+            # with it.
             | \bhttps?://[A-Za-z0-9._\-]+/[A-Za-z0-9._\-]+/[A-Za-z0-9._\-]+\.git
             ",
         )
@@ -573,12 +645,28 @@ fn secret_token_re() -> &'static Regex {
             | [sr]k_(?:live|test)_[A-Za-z0-9]{16,}
             | sk-[A-Za-z0-9_\-]{20,}
             | xox[baprs]-[A-Za-z0-9\-]{10,}
+            # Slack's app-level token (Socket Mode) is not an `xox` at all.
+            | xapp-[0-9]-[A-Za-z0-9\-]{10,}
+            # Google API keys — Firebase, Maps, Places, Cloud. A fixed prefix
+            # and a fixed length, and it was not in the list.
+            | AIza[0-9A-Za-z_\-]{35}
+            # Telegram bot tokens: `<bot id>:AA<secret>`. The `AA` prefix is
+            # what keeps this from matching an ordinary `id:value` pair.
+            | \b[0-9]{6,12}:AA[A-Za-z0-9_\-]{30,}
+            # Discord and Firebase custom tokens: three base64url segments,
+            # like a JWT but without the `eyJ` header that the rule below
+            # anchors on.
+            | \b[MNO][A-Za-z0-9_\-]{22,}\.[A-Za-z0-9_\-]{5,8}\.[A-Za-z0-9_\-]{25,}
             # The whole AWS key-id family, not just long-lived user keys. ASIA
             # (STS session) is the one a compromised CI actually leaks.
             | (?:AKIA|ASIA|AIDA|AROA|AGPA|AIPA|ANPA|ANVA|APKA)[0-9A-Z]{16}
             # Private key material: mask the armour, since the base64 body that
             # follows is on its own lines and matches nothing else here.
-            | -----BEGIN[A-Z ]*PRIVATE\ KEY-----
+            # The space is ESCAPED. `(?x)` strips whitespace inside a character
+            # class too, not only between tokens, so `[A-Z ]*` compiled as
+            # `[A-Z]*` and this rule required `-----BEGINPRIVATE KEY-----`.
+            # It matched no armour any tool has ever emitted.
+            | -----BEGIN[A-Z\ ]*PRIVATE\ KEY-----
             | eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}
             ",
         )
@@ -673,6 +761,52 @@ fn ipv4_re() -> &'static Regex {
     })
 }
 
+/// Hardware addresses, which name the machine rather than the network.
+///
+/// Colon-form MACs were already masked, but only by accident: they collide
+/// with the IPv6 rule. Dash-form had nothing at all, and it is the form
+/// Windows, `ip link` and most driver logs print.
+fn mac_address_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            // The delimiters are captured and restored, as elsewhere: without
+            // a boundary this bites into the middle of a long hex run.
+            r"(?xi)
+              (^|[^0-9A-Za-z:\-])
+              (?:(?:[0-9A-F]{2}-){5}[0-9A-F]{2}|(?:[0-9A-F]{2}:){5}[0-9A-F]{2})
+              ($|[^0-9A-Za-z:\-])
+            ",
+        )
+        .expect("static mac pattern")
+    })
+}
+
+/// An identifier that has been *labelled* as naming the machine.
+///
+/// A bare UUID is deliberately left alone. Request ids, trace ids and span ids
+/// are UUIDs, they are the thread a maintainer follows through a log, and
+/// masking them costs the report the one thing that makes it followable. The
+/// label is what turns the same bytes into a claim about the hardware.
+fn machine_id_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?xi)
+              (^|[^A-Za-z0-9_])
+              ((?:machine|device|hardware|hw|installation|install|node|host)
+                 [-_\ ]?(?:id|uuid|guid)
+              | serial(?:[-_\ ]?(?:number|no|num))?
+              | udid
+              | imei)
+              \s*[:=]?\s*
+              [A-Za-z0-9][A-Za-z0-9._:\-]{5,}
+            ",
+        )
+        .expect("static machine-id pattern")
+    })
+}
+
 /// Hostnames that identify a network rather than a public service.
 ///
 /// The ssh-target rule only fires when there is a `user@`, and error strings
@@ -682,22 +816,125 @@ fn ipv4_re() -> &'static Regex {
 /// Three labels is the floor on purpose, with an alphabetic final label: it
 /// keeps `server.log` and `config.yml` intact, and stops version strings like
 /// `0.6.8-fork.85ce040` being mistaken for hosts.
+/// Suffixes that make a dotted run a hostname rather than an identifier.
+///
+/// Deliberately not exhaustive, and deliberately short of the "new gTLD"
+/// space. `app`, `dev`, `cloud`, `tech`, `systems`, `network`, `email`, `blog`
+/// and their neighbours are all real suffixes AND all common final segments of
+/// module paths, bundle ids and filenames — `com.example.app`,
+/// `config.yml.dev`, `some.package.name.systems`. Including them cost every
+/// mobile crash log its bundle id, which is the first thing a maintainer looks
+/// for.
+///
+/// `rs`, `sh`, `pl`, `md` and `so` are out for the same reason: they are file
+/// extensions far more often than they are Serbia, and `webpack.config.prod.js`
+/// must survive.
+///
+/// The trade is that a host on a suffix outside this list is not matched by
+/// *this* rule. The private-suffix rule, `user@host` and the git-remote rule
+/// are what cover the shapes that carry a name in practice.
+const HOST_SUFFIXES: &[&str] = &[
+    "com", "net", "org", "edu", "gov", "mil", "int", "info", "biz", "name", "pro", "coop", "aero",
+    "io", "co", "ai", "xyz", "eu", "us", "uk", "de", "fr", "jp", "cn", "ru", "br", "in", "au",
+    "ca", "ch", "nl", "se", "no", "fi", "dk", "es", "it", "be", "at", "cz", "pt", "gr", "hu", "ro",
+    "tr", "ua", "kr", "tw", "hk", "sg", "nz", "za", "mx", "ar", "cl", "ie", "il", "lt", "lv", "ee",
+    "sk", "si", "hr", "bg", "by", "kz", "th", "vn", "ph", "id", "my",
+];
+
+/// Suffixes that name a private network outright, wherever they appear.
+///
+/// A match containing one of these is masked without further argument: nothing
+/// legitimate is called `bastion.internal.acme.corp`.
+const PRIVATE_SUFFIXES: &[&str] = &[
+    "corp", "internal", "intranet", "local", "lan", "home", "priv", "private", "arpa",
+];
+
+/// Hostnames that identify a network rather than a public service.
+///
+/// The ssh-target rule only fires when there is a `user@`, and error strings
+/// overwhelmingly carry a bare FQDN instead ("Could not resolve hostname
+/// bastion.internal.acme.corp").
+///
+/// The pattern is built from [`HOST_SUFFIXES`] and [`PRIVATE_SUFFIXES`] rather
+/// than restating them, so the regex and the guards in [`mask_hosts`] cannot
+/// drift apart — which is the failure that would quietly turn the guards off.
 fn private_host_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(
+        let private = PRIVATE_SUFFIXES.join("|");
+        let public = HOST_SUFFIXES.join("|");
+        Regex::new(&format!(
             r"(?xi)
-              [A-Za-z0-9_\-]+(?:\.[A-Za-z0-9_\-]+)*\.(?:corp|internal|intranet|local|lan|home|priv|private|arpa)\b
-            # Four labels, and case-sensitive: hostnames are conventionally
-            # lowercase, while a capitalised label means a class name. Three
-            # labels ate `config.yml.bak` and `os.path.join`; case-insensitivity
-            # ate `java.lang.Thread.run`. A capitalised host under a private
-            # suffix is still caught by the rule above.
-            | (?-i:[a-z0-9_\-]+(?:\.[a-z0-9_\-]+){2,}\.[a-z]{2,})\b
-            ",
-        )
+              # A private suffix, plus anything after it. The trailing group is
+              # what stops the rule biting off `bastion.corp` and publishing
+              # `acme-inc.com` — the interesting half of the name.
+              [A-Za-z0-9_\-]+(?:\.[A-Za-z0-9_\-]+)*
+              \.(?:{private})
+              (?:\.[A-Za-z0-9_\-]+)*\b
+            # Three or more labels under a real suffix, and case-sensitive:
+            # a capitalised label means a class name, and case-insensitivity
+            # ate `java.lang.Thread.run`.
+            | (?-i:
+                [a-z0-9_\-]+(?:\.[a-z0-9_\-]+){{1,}}\.(?:{public})
+              )\b
+            "
+        ))
         .expect("static private-host pattern")
     })
+}
+
+/// Apply [`private_host_re`], with the two guards a regex cannot express.
+///
+/// The suffix list alone is not a sufficient discriminator, because a hostname
+/// and a reverse-DNS identifier are the same string in opposite orders:
+///
+/// - **A hostname ENDS with its suffix; an identifier BEGINS with one.**
+///   `bastion.corp.acme.com` versus `com.example.app`. Testing only the final
+///   label masked every Android, Java and Apple bundle id in a crash log,
+///   which is the first line a maintainer reads.
+/// - **A hostname is not a prefix of a longer dotted run.** `std.foo.io` inside
+///   `std.foo.io.println` matched, and the result — `<host>.println` — says
+///   less than either half of it did.
+///
+/// Neither is expressible in this engine, which has no lookaround, so both are
+/// decided here with the match in hand.
+fn mask_hosts(text: &str) -> String {
+    private_host_re()
+        .replace_all(text, |caps: &regex::Captures<'_>| {
+            let Some(matched) = caps.get(0) else {
+                return String::new();
+            };
+            let found = matched.as_str();
+            let labels: Vec<&str> = found.split('.').collect();
+
+            // A private suffix anywhere is decisive; the guards below do not
+            // apply to it.
+            let is_private = labels.iter().any(|label| {
+                PRIVATE_SUFFIXES
+                    .iter()
+                    .any(|s| label.eq_ignore_ascii_case(s))
+            });
+            if is_private {
+                return "<host>".to_string();
+            }
+
+            let starts_with_a_suffix = labels
+                .first()
+                .is_some_and(|first| HOST_SUFFIXES.iter().any(|s| first.eq_ignore_ascii_case(s)));
+            let continues_past_the_match = text
+                .get(matched.end()..)
+                .and_then(|rest| rest.strip_prefix('.'))
+                .is_some_and(|rest| {
+                    rest.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+                });
+
+            if starts_with_a_suffix || continues_past_the_match {
+                found.to_string()
+            } else {
+                "<host>".to_string()
+            }
+        })
+        .to_string()
 }
 
 /// Another account's home directory. The current user's is rewritten to `~`
@@ -706,19 +943,39 @@ fn home_path_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
+            // The captured left delimiter, restored by `${1}` in the
+            // replacement, applies ONLY to the alternatives that need one:
+            // `~name`, which would otherwise eat `HEAD~1`, and the driveless
+            // Windows path, which would otherwise match inside `MyUsers\bob`.
+            //
+            // Requiring it everywhere narrowed the absolute-path alternatives
+            // and reintroduced a leak: `prefix/home/alice/x` stopped matching,
+            // so any concatenated or prefix-tagged path published the account
+            // name. Group 1 simply does not participate in the alternatives
+            // below, and `${1}` expands to nothing there.
             r"(?xi)
-              (?:/Users|/home)/[^\s\x22/]+(?:/[^\s\x22]*)?
-            # Root's home is still an account's home, and a path under it says
-            # the process ran privileged.
-            | /var/root\b(?:/[^\s\x22]*)?
-            | /root\b(?:/[^\s\x22]*)?
-            # macOS per-user temp: the salt uniquely identifies the user.
-            | /private/var/folders/[^\s\x22]*
-            | /var/folders/[^\s\x22]*
-            # `~alice/.bashrc` names the account without any /home prefix.
-            | ~[A-Za-z0-9._\-]+(?:/[^\s\x22]*)?
-            | [A-Z]:\\Users\\[^\\/\s\x22]+(?:\\[^\s\x22]*)?
-            | [A-Z]:\\Documents\ and\ Settings\\[^\\/\s\x22]+(?:\\[^\s\x22]*)?
+              (?:
+                (?:/Users|/home)/[^\s\x22/]+(?:/[^\s\x22]*)?
+              # Root's home is still an account's home, and a path under it says
+              # the process ran privileged.
+              | /var/root\b(?:/[^\s\x22]*)?
+              | /root\b(?:/[^\s\x22]*)?
+              # macOS per-user temp: the salt uniquely identifies the user.
+              | /private/var/folders/[^\s\x22]*
+              | /var/folders/[^\s\x22]*
+              # `~alice/.bashrc` names the account without any /home prefix.
+              # The first character must be a LETTER: `HEAD~1` and `main~2` are
+              # git revisions, and with a digit allowed here every one of them
+              # in a pasted command became `<path>`.
+              | (^|[^A-Za-z0-9_])~[A-Za-z][A-Za-z0-9._\-]*(?:/[^\s\x22]*)?
+              # A UNC path names the file server as well as the account.
+              | \\\\[A-Za-z0-9._\-]+\\[^\s\x22]*
+              # The drive letter is OPTIONAL. A stack trace prints the path
+              # relative to the profile root, and `Users\bob\...` named the
+              # account with nothing to stop it.
+              | (^|[^A-Za-z0-9_])(?:[A-Z]:)?\\?Users\\[^\\/\s\x22]+(?:\\[^\s\x22]*)?
+              | (^|[^A-Za-z0-9_])(?:[A-Z]:)?\\?Documents\ and\ Settings\\[^\\/\s\x22]+(?:\\[^\s\x22]*)?
+              )
             ",
         )
         .expect("static home-path pattern")
@@ -959,5 +1216,261 @@ mod tests {
         ] {
             assert_eq!(redactor.scrub(input), expected, "{input:?}");
         }
+    }
+
+    /// Assert that nothing recognisable from `secret` survives.
+    ///
+    /// Comparing against an exact expected string would pass while the rule
+    /// masked only a prefix — which is how the git-remote hole stayed open:
+    /// `git@github.com:org/private.git` matched as an email, so the address
+    /// went and the org and repository were published in the tail.
+    fn assert_gone(redactor: &Redactor, input: &str, secret: &str) {
+        let out = redactor.scrub(input);
+        assert!(
+            !out.contains(secret),
+            "{secret:?} survived redaction of {input:?}: {out}"
+        );
+    }
+
+    #[test]
+    fn private_key_armour_is_masked() {
+        // `(?x)` strips whitespace INSIDE a character class in this engine, so
+        // `[A-Z ]*` compiled as `[A-Z]*` and the rule only ever matched
+        // `-----BEGINPRIVATE KEY-----`, which nothing emits. Every real key
+        // header went through untouched, and the base64 body after it matches
+        // no other rule.
+        let redactor = redactor();
+        for armour in [
+            "-----BEGIN PRIVATE KEY-----",
+            "-----BEGIN RSA PRIVATE KEY-----",
+            "-----BEGIN OPENSSH PRIVATE KEY-----",
+            "-----BEGIN EC PRIVATE KEY-----",
+        ] {
+            assert_gone(&redactor, armour, "PRIVATE KEY");
+        }
+    }
+
+    #[test]
+    fn forge_urls_lose_the_org_and_repository_without_a_dot_git() {
+        // The rule required a trailing `.git`, which is the one form a human
+        // reading an error message rarely sees. `fatal: repository
+        // 'https://github.com/acme/prod-vault/' not found` is what git
+        // actually prints, and the private repository name rode out in it.
+        let redactor = redactor();
+        for input in [
+            "See https://github.com/acmecorp/prod-vault",
+            "https://github.com/acmecorp/prod-vault/pull/42",
+            "https://gitlab.com/acmecorp/prod-vault/-/tree/main",
+            "repository 'https://github.com/acmecorp/prod-vault/' not found",
+            // Case in the scheme was enough to defeat it even WITH the `.git`.
+            "at HTTPS://github.com/acmecorp/prod-vault.git",
+        ] {
+            assert_gone(&redactor, input, "acmecorp");
+            assert_gone(&redactor, input, "prod-vault");
+        }
+    }
+
+    #[test]
+    fn credential_shapes_the_pattern_list_had_missed() {
+        let redactor = redactor();
+        for (input, secret) in [
+            // Firebase / Maps / Cloud. A single very common shape, absent.
+            (
+                "key AIzaSyD-1234567890abcdefghijklmnopqrstu",
+                "AIzaSyD-1234567890abcdefghijklmnopqrstu",
+            ),
+            // Slack app-level (Socket Mode). Only `xox[baprs]-` was listed.
+            (
+                "xapp-1-A00000000-1234567890-abcdefabcdefabcdef",
+                "xapp-1-A00000000",
+            ),
+            (
+                "bot 123456789:AAG1234567890abcdefghijklmnopqrstuv",
+                "AAG1234567890abcdefghijklmnopqrstuv",
+            ),
+        ] {
+            assert_gone(&redactor, input, secret);
+        }
+    }
+
+    #[test]
+    fn windows_and_unc_paths_name_no_account() {
+        // The rule required a drive letter. A relative `Users\bob\...` is what
+        // a stack trace prints, and a UNC path names both the file server and
+        // the account.
+        let redactor = redactor();
+        assert_gone(&redactor, r"at Users\bob\Documents\Diary.txt", "bob");
+        assert_gone(&redactor, r"\\fileserver\share\alice\q.docx", "alice");
+        assert_gone(&redactor, r"\\fileserver\share\alice\q.docx", "fileserver");
+    }
+
+    #[test]
+    fn hardware_addresses_are_masked() {
+        let redactor = redactor();
+        // Colon-form MACs are already caught, but incidentally — they collide
+        // with the IPv6 rule. Dash-form had nothing.
+        assert_gone(&redactor, "iface aa-bb-cc-dd-ee-ff up", "aa-bb-cc-dd-ee-ff");
+        assert_gone(&redactor, "iface aa:bb:cc:dd:ee:ff up", "aa:bb:cc:dd:ee:ff");
+    }
+
+    #[test]
+    fn labelled_machine_identifiers_are_masked() {
+        // A bare UUID stays: request and trace ids are UUIDs, they are the
+        // thread a maintainer follows through a log, and masking them costs
+        // the report its correlation. A *labelled* one is a different claim
+        // about the same bytes.
+        let redactor = redactor();
+        for input in [
+            "machine-id 550e8400-e29b-41d4-a716-446655440000",
+            "device_id=550e8400-e29b-41d4-a716-446655440000",
+            "serial number C02XG2JMJGH8",
+        ] {
+            let out = redactor.scrub(input);
+            assert!(
+                !out.contains("550e8400") && !out.contains("C02XG2JMJGH8"),
+                "{input:?} kept its identifier: {out}"
+            );
+        }
+        let trace = "request 550e8400-e29b-41d4-a716-446655440000 failed";
+        assert_eq!(
+            redactor.scrub(trace),
+            trace,
+            "an unlabelled UUID is a correlation id and must survive"
+        );
+    }
+
+    #[test]
+    fn dotted_module_paths_are_not_hostnames() {
+        // The four-label rule masked any all-lowercase dotted run ending in
+        // letters, which is the exact shape of a Python, Java or Kotlin stack
+        // frame. Every Django traceback lost the line that says where the bug
+        // is — and a log block scrubbed into uselessness costs the maintainer
+        // the same round trip as no log block at all.
+        let redactor = redactor();
+        for path in [
+            "django.contrib.auth.models",
+            "django.contrib.auth.models.User.save",
+            "org.jetbrains.kotlin.compiler.plugin",
+            "boto3.session.session.client",
+            "server.log.old.tmp",
+            "webpack.config.prod.js",
+            "std::collections::HashMap",
+            "java.lang.Thread.run",
+        ] {
+            assert_eq!(redactor.scrub(path), path, "mangled a module path");
+        }
+    }
+
+    #[test]
+    fn real_hostnames_are_still_masked_whole() {
+        let redactor = redactor();
+        for (input, kept) in [
+            ("could not resolve bastion.internal.acme.corp", "acme"),
+            // The private-suffix alternative stopped at `corp` and left the
+            // rest, so the interesting half of the name was published.
+            ("could not resolve bastion.corp.acme-inc.com", "acme-inc"),
+            ("could not resolve db01.prod.acme-inc.com", "acme-inc"),
+            ("could not resolve db01.prod.acme-inc.co.uk", "acme-inc"),
+        ] {
+            assert_gone(&redactor, input, kept);
+        }
+    }
+
+    #[test]
+    fn sourcehut_urls_lose_the_org_and_repository() {
+        // `(?:github|gitlab|...|sr\.ht)\.[a-z]+/` required a label AFTER the
+        // forge name, so the `sr.ht` alternative could only ever match
+        // `sr.ht.something/…`, which is not a host. Every real sourcehut URL
+        // went through, and the fallback alternative wants a `.git` suffix a
+        // browser-copied URL does not have.
+        let redactor = redactor();
+        for input in [
+            "https://sr.ht/orguser/prod-vault",
+            "https://git.sr.ht/~orguser/prod-vault",
+            "cloning https://git.sr.ht/~orguser/prod-vault failed",
+        ] {
+            assert_gone(&redactor, input, "orguser");
+            assert_gone(&redactor, input, "prod-vault");
+        }
+    }
+
+    #[test]
+    fn a_forge_url_does_not_swallow_the_sentence_after_it() {
+        // `[^\s\x22]*` ate trailing punctuation and then the rest of the
+        // line, so the diagnosis around the URL disappeared with it.
+        let redactor = redactor();
+        let out = redactor.scrub("issue at https://github.com/acme/vault/pull/42; then it dies");
+        assert!(
+            out.contains("then it dies"),
+            "the text after the URL was consumed: {out}"
+        );
+        let out = redactor.scrub("try https://github.com/acme/vault) and report");
+        assert!(out.contains("and report"), "{out}");
+    }
+
+    #[test]
+    fn a_home_path_is_masked_wherever_it_appears() {
+        // The captured left delimiter was added for the tilde alternative, and
+        // applying it to the absolute-path alternatives narrowed them: a
+        // `/Users/...` preceded by a word character stopped matching, so a
+        // concatenated or prefix-tagged path leaked the account name.
+        let redactor = redactor();
+        for input in [
+            "/home/someone/x",
+            "at /home/someone/x",
+            "path=/home/someone/x",
+            "file:///home/someone/x",
+            "prefix/home/someone/x",
+            "\"/home/someone/x\"",
+        ] {
+            assert_gone(&redactor, input, "someone");
+        }
+    }
+
+    #[test]
+    fn reverse_dns_identifiers_are_not_hostnames() {
+        // A hostname ENDS with its suffix; a reverse-DNS identifier BEGINS with
+        // one. The TLD list could not tell them apart, so every Android, Java
+        // and Apple bundle id became `<host>` — `com.example.app` is the single
+        // most common identifier shape in a mobile crash log.
+        let redactor = redactor();
+        for input in [
+            "com.example.app crashed",
+            "launched bundle com.apple.dock.app",
+            "at org.jetbrains.kotlin.compiler.plugin",
+            "uk.co.example.service started",
+        ] {
+            assert_eq!(redactor.scrub(input), input, "mangled a reverse-DNS id");
+        }
+    }
+
+    #[test]
+    fn a_dotted_run_longer_than_the_match_is_left_alone() {
+        // The rule matched a PREFIX of a longer dotted path and masked it,
+        // leaving a tail — `<host>.println` says less than either half.
+        let redactor = redactor();
+        for input in [
+            "stack: at std.foo.io.println",
+            "error opening config.yml.dev.bak",
+            "some.long.package.name.systems.thing",
+        ] {
+            assert_eq!(redactor.scrub(input), input, "bit a prefix out of a path");
+        }
+    }
+
+    #[test]
+    fn git_revisions_are_not_home_directories() {
+        // `~[A-Za-z0-9._-]+` had no left boundary, so every tilde-suffixed
+        // git revision in a command line became `<path>`.
+        let redactor = redactor();
+        for input in [
+            "git reset --hard HEAD~1",
+            "git log HEAD~3..HEAD",
+            "rebase onto main~2",
+        ] {
+            assert_eq!(redactor.scrub(input), input, "mangled a git revision");
+        }
+        // …while the thing the rule is actually for still goes.
+        assert_gone(&redactor, "cat ~someone/.bashrc", "someone");
     }
 }

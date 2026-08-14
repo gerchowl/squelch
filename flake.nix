@@ -32,8 +32,51 @@
               inherit system;
               overlays = [ devkit.overlays.default ];
             };
+            # Shared by BOTH mkRustProject calls below, which is the point of
+            # naming it: crane's source filter walks the crate directories for
+            # cargo sources, so neither of these reaches a sandbox on its own,
+            # and `tests/issue_form.rs` `include_str!`s both. Passing them to
+            # one project and not the other is exactly the drift that broke the
+            # x86_64-linux run — the MSRV project has its own `cleanSrc`, and
+            # it also runs the test suite.
+            extraSrcFiles = [
+              ".github/ISSUE_TEMPLATE/bug.yml"
+              "README.md"
+            ];
+            # The same project at the MSRV `Cargo.toml` declares, for one
+            # question only: does it still compile there?
+            #
+            # Clippy, rustdoc, cargo-deny and nextest are all off: running them
+            # on an old compiler measures the compiler, not the crate — lints
+            # move, and a lint that did not exist yet failing here would say
+            # nothing about whether a consumer pinned there can use this.
+            #
+            # crane's `buildPackage` still runs `cargo test` in its check phase,
+            # so the suite does execute at the MSRV. That is worth having and is
+            # why this project needs the same `extraSrcFiles` as the main one.
+            msrv = devkit.lib.mkRustProject {
+              inherit pkgs;
+              src = ./.;
+              inherit extraSrcFiles;
+              # `-p squelch` and NOT `--workspace`: the MSRV is a promise
+              # about the PUBLISHED crate, and the demo app is not published.
+              #
+              # `--all-features` because the promise has to cover the features
+              # a consumer can turn on — and it is `endpoint` that sets the
+              # floor here, by way of ureq → url → idna → idna_adapter.
+              cargoExtraArgs = "-p squelch --all-features";
+              toolchainFile = ./.msrv/rust-toolchain.toml;
+              toolchainHash = "sha256-X/4ZBHO3iW0fOenQ3foEvscgAPJYl2abspaBThDOukI=";
+              clippy = false;
+              fmt = false;
+              nextest = false;
+              doc = false;
+              doctest = false;
+              deny = false;
+              auditable = false;
+            };
           in
-          f pkgs (
+          f pkgs msrv (
             devkit.lib.mkRustProject {
               # devkit.overlays.default is NOT optional: mkProjectShell pulls
               # nix/devtools.nix, which references `vig-utils` from pkgs. A
@@ -53,6 +96,7 @@
               # the check still reports success — nextest said "59 tests across
               # 1 binary" while thirteen e2e tests sat there unrun.
               cargoExtraArgs = "--all-features --workspace";
+              inherit extraSrcFiles;
               # For ./rust-toolchain.toml. Changes when the channel or the
               # component list does; the build failure prints the new one.
               toolchainHash = "sha256-mvUGEOHYJpn3ikC5hckneuGixaC+yGrkMM/liDIDgoU=";
@@ -61,13 +105,22 @@
         );
     in
     {
-      devShells = forEachSystem (_: rust: { default = rust.devShell; });
-      packages = forEachSystem (_: rust: rust.packages);
+      devShells = forEachSystem (_: _: rust: { default = rust.devShell; });
+      packages = forEachSystem (_: _: rust: rust.packages);
 
       checks = forEachSystem (
-        pkgs: rust:
+        pkgs: msrv: rust:
         rust.checks
         // {
+          # `rust-version` is a promise about this crate's API surface, and it
+          # was verified by nothing. A declared but unverified MSRV is a FALSE
+          # promise, not a weak one — the failure lands on the downstream, who
+          # has no way to tell it from their own mistake.
+          #
+          # It said 1.74 when nothing checked, and 1.74 cannot build this crate
+          # at all. The number in Cargo.toml is now whatever this check passes
+          # with, or the declaration comes out.
+          msrv = msrv.checks.workspace;
           # Every feature combination must COMPILE — the pack's checks all run
           # with one feature set, and `--all-features` is the set least likely
           # to break. It hid a real one: `endpoint` uses `serde_json::json!`
@@ -91,8 +144,14 @@
               inherit (rust) cargoArtifacts;
               pnameSuffix = "-feature-powerset";
               nativeBuildInputs = (rust.commonArgs.nativeBuildInputs or [ ]) ++ [ pkgs.cargo-hack ];
+              # `--offline`, not `--locked`. `--no-dev-deps` rewrites the real
+              # Cargo.toml while it runs, and once a dev-dependency is dev-ONLY
+              # (proptest, the YAML parser) the lock then describes packages the
+              # manifest no longer mentions, so `--locked` refuses. `--offline`
+              # is just as hermetic here: crane has vendored every dependency
+              # and the sandbox has no network to fall back to.
               buildPhaseCargoCommand = ''
-                cargo hack check -p squelch --feature-powerset --no-dev-deps --locked
+                cargo hack check -p squelch --feature-powerset --no-dev-deps --offline
               '';
             }
           );
