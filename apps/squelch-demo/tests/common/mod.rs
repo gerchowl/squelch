@@ -74,6 +74,11 @@ pub const CANARIES: &[(&str, &str)] = &[
     ("driveless windows account", "bobtestuser"),
     ("unc path", "fileserver"),
     ("mac address", "aa-bb-cc-dd-ee-ff"),
+    // Five adversarial rounds on the host rule, each finding what the last
+    // round's fix opened. These are the shapes that leaked.
+    ("corporate root with no public tld", "acme-inc"),
+    ("shouted tld", "shoutyhost"),
+    ("country-code first label", "ccfirsthost"),
 ];
 
 /// Text that must SURVIVE. Over-masking makes the block worthless just as
@@ -88,6 +93,12 @@ pub const SURVIVORS: &[&str] = &[
     // The tilde-home rule had no left boundary, so every revision in a pasted
     // git command came out as `HEAD<path>`.
     "HEAD~1",
+    // Reverse-DNS package paths. Telling these from a hostname is what the
+    // host rule spent five rounds on: they are the same string in opposite
+    // orders.
+    "com.acme.internal.util",
+    "io.netty.internal.buffer",
+    "com.acme.internal-tools.util.Client",
 ];
 
 /// A JSONL log corpus with a canary in every position that matters:
@@ -137,6 +148,14 @@ pub fn canary_logs() -> String {
         // pins both ends of the rule.
         r#"{"timestamp":"2026-08-12T09:00:22Z","level":"error","event":"trace","message":"at django.contrib.auth.models.User.save and org.jetbrains.kotlin.compiler.plugin"}"#,
         r#"{"timestamp":"2026-08-12T09:00:23Z","level":"info","event":"git","message":"ran git reset --hard HEAD~1"}"#,
+        // A private root with no public suffix at the end, a TLD in caps, and
+        // a country code in the first label — three shapes that walked past
+        // the host rule in three different rounds.
+        r#"{"timestamp":"2026-08-12T09:00:24Z","level":"error","event":"dns","message":"resolve bastion.corp.acme-inc failed"}"#,
+        r#"{"timestamp":"2026-08-12T09:00:25Z","level":"error","event":"dns","message":"resolve shoutyhost.internal.acme.NET failed"}"#,
+        r#"{"timestamp":"2026-08-12T09:00:26Z","level":"error","event":"dns","message":"resolve us.internal.ccfirsthost.com failed"}"#,
+        // …and the package paths that share their shape and must survive.
+        r#"{"timestamp":"2026-08-12T09:00:27Z","level":"error","event":"trace","message":"at com.acme.internal.util and io.netty.internal.buffer and com.acme.internal-tools.util.Client"}"#,
     ]
     .join("\n")
 }
