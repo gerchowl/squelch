@@ -62,6 +62,19 @@
 //! matched by *this* rule; the private-suffix, `user@host` and git-remote
 //! rules are what cover the shapes that carry a name in practice.
 //!
+//! **A bare two-label `<word>.local`.** `printer.local` is kept, because
+//! `.env.local`, `settings.local` and `keys.private` are the same shape and
+//! are in every project there is. At two labels the name has to *look* like a
+//! machine — a digit or a hyphen — before it is treated as one. That is a
+//! narrower loss than it sounds: the names which actually identify a person
+//! are the ones macOS and DHCP generate, and those carry hyphens
+//! (`alices-macbook.local` is masked).
+//!
+//! The trade runs the other way too. A three-label filename ending in a
+//! private suffix — `docker-compose.override.local` — is masked, because at
+//! three labels the shape really is a hostname's. A filename costs a round
+//! trip; a hostname does not come back.
+//!
 //! Free-form user prose. If your reporter types their employer's name into the
 //! description field, that is their disclosure to make — the crate's job is to
 //! ensure *it* did not add anything they did not choose to say.
@@ -887,21 +900,47 @@ fn private_host_re() -> &'static Regex {
     })
 }
 
-/// Apply [`private_host_re`], with the two guards a regex cannot express.
+/// Suffixes that are two labels wearing one job.
 ///
-/// The suffix list alone is not a sufficient discriminator, because a hostname
-/// and a reverse-DNS identifier are the same string in opposite orders:
+/// `co.uk` is a single public suffix. Counting it as two labels made
+/// `module.co.uk` look like a three-label FQDN when it is a bare registrable
+/// domain with nothing in front of it. A hand-written slice rather than the
+/// public suffix list: this crate depends on `regex` and nothing else, and the
+/// handful below covers the compound suffixes that actually appear.
+const COMPOUND_SUFFIXES: &[&str] = &[
+    "co.uk", "ac.uk", "org.uk", "gov.uk", "co.jp", "ne.jp", "or.jp", "com.au", "net.au", "com.br",
+    "co.nz", "co.za", "co.in", "com.cn", "com.mx", "com.tr",
+];
+
+/// Whether a label looks like it names a machine rather than a word.
 ///
+/// A digit or a hyphen is the cheapest positive signal there is: `db01`,
+/// `web-3`, `ip-10-0-1-5`, `alices-macbook` all carry one, and `env`,
+/// `settings`, `keys`, `config` do not. It is what lets a two-label
+/// `X.local` be judged at all — and it is not an accident that the names
+/// which actually identify a person are the ones macOS and DHCP generate with
+/// hyphens in them.
+fn looks_like_a_machine(label: &str) -> bool {
+    label.contains('-') || label.bytes().any(|b| b.is_ascii_digit())
+}
+
+/// Apply [`private_host_re`], with the guards a regex cannot express.
+///
+/// The pattern is deliberately loose; every real decision is made here, with
+/// the match in hand. A hostname and a reverse-DNS identifier are the same
+/// string in opposite orders, and no amount of alternation settles that.
+///
+/// - **A suffix is only a suffix at the END.** `internal` and `corp` are a
+///   Kotlin visibility keyword and a routine Java package segment, so matching
+///   them anywhere destroyed every stack frame that contained one.
 /// - **A hostname ENDS with its suffix; an identifier BEGINS with one.**
-///   `bastion.corp.acme.com` versus `com.example.app`. Testing only the final
-///   label masked every Android, Java and Apple bundle id in a crash log,
-///   which is the first line a maintainer reads.
-/// - **A hostname is not a prefix of a longer dotted run.** `std.foo.io` inside
-///   `std.foo.io.println` matched, and the result — `<host>.println` — says
-///   less than either half of it did.
-///
-/// Neither is expressible in this engine, which has no lookaround, so both are
-/// decided here with the match in hand.
+///   `bastion.corp.acme.com` against `com.example.app`.
+/// - **A hostname is not a prefix of a longer dotted run.** `std.foo.io`
+///   inside `std.foo.io.println` matched, and `<host>.println` says less than
+///   either half did.
+/// - **Two labels is not enough on its own.** `local`, `home` and `private`
+///   are English words, and `.env.local` is in every Vite, Next and Django
+///   project there is. At two labels the name has to look like a machine.
 fn mask_hosts(text: &str) -> String {
     private_host_re()
         .replace_all(text, |caps: &regex::Captures<'_>| {
@@ -910,32 +949,72 @@ fn mask_hosts(text: &str) -> String {
             };
             let found = matched.as_str();
             let labels: Vec<&str> = found.split('.').collect();
+            let keep = || found.to_string();
+            let mask = || "<host>".to_string();
 
-            // A private suffix anywhere is decisive; the guards below do not
-            // apply to it.
-            let is_private = labels.iter().any(|label| {
-                PRIVATE_SUFFIXES
-                    .iter()
-                    .any(|s| label.eq_ignore_ascii_case(s))
-            });
-            if is_private {
-                return "<host>".to_string();
+            let is = |label: &str, set: &[&str]| set.iter().any(|s| label.eq_ignore_ascii_case(s));
+            let Some(last) = labels.last() else {
+                return keep();
+            };
+
+            // A private suffix, and only when it is the last label.
+            if is(last, PRIVATE_SUFFIXES) {
+                let preceding = labels.len().saturating_sub(1);
+                return if preceding >= 2 || labels.first().is_some_and(|l| looks_like_a_machine(l))
+                {
+                    mask()
+                } else {
+                    keep()
+                };
             }
 
-            let starts_with_a_suffix = labels
+            // Otherwise it has to end in a public suffix to be a host at all.
+            // The pattern's private alternative can match a run whose last
+            // label is neither — `com.foo.internal.Impl` — and that is a
+            // package path.
+            let compound = labels
+                .len()
+                .checked_sub(2)
+                .and_then(|at| labels.get(at))
+                .is_some_and(|penultimate| {
+                    let pair = format!("{penultimate}.{last}");
+                    COMPOUND_SUFFIXES
+                        .iter()
+                        .any(|s| pair.eq_ignore_ascii_case(s))
+                });
+            if !compound && !is(last, HOST_SUFFIXES) {
+                return keep();
+            }
+
+            // A reverse-DNS identifier begins with the suffix a hostname ends
+            // with.
+            if labels
                 .first()
-                .is_some_and(|first| HOST_SUFFIXES.iter().any(|s| first.eq_ignore_ascii_case(s)));
-            let continues_past_the_match = text
+                .is_some_and(|first| is(first, HOST_SUFFIXES) || is(first, PRIVATE_SUFFIXES))
+            {
+                return keep();
+            }
+
+            // A prefix of a longer dotted run is part of that run, not a host.
+            let continues = text
                 .get(matched.end()..)
                 .and_then(|rest| rest.strip_prefix('.'))
                 .is_some_and(|rest| {
                     rest.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
                 });
+            if continues {
+                return keep();
+            }
 
-            if starts_with_a_suffix || continues_past_the_match {
-                found.to_string()
+            // Subdomains live to the LEFT of the registrable domain, so a bare
+            // `<name>.<suffix>` is a domain rather than a host, and two labels
+            // in front of a compound suffix is the same shape as three in
+            // front of a simple one.
+            let suffix_labels = if compound { 2 } else { 1 };
+            if labels.len().saturating_sub(suffix_labels) >= 2 {
+                mask()
             } else {
-                "<host>".to_string()
+                keep()
             }
         })
         .to_string()
@@ -1482,6 +1561,72 @@ mod tests {
         ] {
             assert_eq!(redactor.scrub(input), input, "bit a prefix out of a path");
         }
+    }
+
+    #[test]
+    fn a_private_suffix_mid_run_is_not_a_hostname() {
+        // `PRIVATE_SUFFIXES` matched ANY label anywhere and masked
+        // unconditionally, so `internal` and `corp` — a Kotlin visibility
+        // keyword and a routine Java package segment — destroyed every frame
+        // that contained one. The suffix has to be the LAST label to be a
+        // suffix at all.
+        let redactor = redactor();
+        for input in [
+            "at com.foo.internal.Impl",
+            "kotlin.internal.PlatformDependent",
+            "at com.corp.acme.Service",
+            "com.acme.internal.security.Token",
+        ] {
+            assert_eq!(redactor.scrub(input), input, "mangled a package path");
+        }
+    }
+
+    #[test]
+    fn a_dotfile_is_not_a_machine_on_the_local_network() {
+        // `local`, `home`, `private` are English words as well as private
+        // suffixes, and `.env.local` is in every Vite, Next and Django project
+        // there is. Two labels alone is not enough to call something a host.
+        let redactor = redactor();
+        for input in [
+            "cannot read .env.local",
+            "settings.local missing",
+            "keys.private not found",
+            "loading config.local",
+        ] {
+            assert_eq!(redactor.scrub(input), input, "mangled a filename");
+        }
+    }
+
+    #[test]
+    fn a_machine_on_the_local_network_is_still_masked() {
+        // The other side of the same rule. Three labels is enough on its own;
+        // at two, the name has to look like a host — which the ones that
+        // actually identify someone do, because that is how macOS and DHCP
+        // generate them.
+        let redactor = redactor();
+        for (input, secret) in [
+            ("resolve bastion.internal.acme.corp", "acme"),
+            ("resolve ip-10-0-1-5.ec2.internal", "ip-10-0-1-5"),
+            ("resolve web.default.svc.cluster.local", "default"),
+            ("resolve alices-macbook.local failed", "alices-macbook"),
+            ("resolve db01.local failed", "db01"),
+        ] {
+            assert_gone(&redactor, input, secret);
+        }
+    }
+
+    #[test]
+    fn a_registrable_domain_under_a_compound_suffix_is_not_a_host() {
+        // `co.uk` is one suffix wearing two labels. Counting it as two made
+        // `module.co.uk` look like a three-label FQDN when it is a bare
+        // registrable domain with nothing in front of it.
+        let redactor = redactor();
+        assert_eq!(
+            redactor.scrub("module.co.uk is a thing"),
+            "module.co.uk is a thing"
+        );
+        // …and a real host under one still goes.
+        assert_gone(&redactor, "resolve db01.acme-inc.co.uk failed", "acme-inc");
     }
 
     #[test]
