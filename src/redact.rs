@@ -62,6 +62,58 @@
 //! matched by *this* rule; the private-suffix, `user@host` and git-remote
 //! rules are what cover the shapes that carry a name in practice.
 //!
+//! **A bare two-label `<word>.local` or `<word>.private`.** `printer.local` is
+//! kept, because `.env.local`, `settings.local` and `keys.private` are the same
+//! shape and are in every project there is. At two labels a name under one of
+//! those two suffixes has to *look* like a machine — a digit or a hyphen —
+//! before it is treated as one. That is a narrower loss than it sounds: the
+//! names which actually identify a person are the ones macOS and DHCP
+//! generate, and those carry hyphens (`alices-macbook.local` is masked).
+//!
+//! Only those two suffixes. There is no `settings.corp` or `keys.intranet`, so
+//! `bastion.corp`, `vault.internal` and `db.lan` are masked at two labels like
+//! anything else — relaxing every private suffix uniformly leaked exactly the
+//! names the rule exists for.
+//!
+//! The trade runs the other way too, and two losses are accepted on purpose:
+//!
+//! - A three-label filename ending in a private suffix —
+//!   `docker-compose.override.local` — is masked, because at three labels the
+//!   shape really is a hostname's.
+//! - A module path from an ecosystem that does *not* use reverse-DNS, with a
+//!   private-suffix word in the middle — `myapp.internal.helpers` — is masked.
+//!   It is indistinguishable from `bastion.corp.acme-inc`, and only one of the
+//!   two is recoverable when the rule guesses wrong.
+//!
+//! A filename or a frame costs a round trip; a hostname does not come back.
+//!
+//! Two known leaks, both consequences of the `.local` relaxation and both
+//! kept because the fix endangers `.env.local`: a bare `printer.local`, and an
+//! address immediately followed by a dotted name — `10.1.2.3.acme.local`
+//! leaves `acme.local` behind, because the IP rule runs first and the
+//! remaining two labels then look like a filename.
+//!
+//! # This rule is a prior, not a classifier
+//!
+//! A hostname and a reverse-DNS identifier are the same string in opposite
+//! orders, and no context-free test over a dotted token settles which is
+//! which. Case is a convention Java breaks with `com.foo.internal.impl` and
+//! DNS breaks with `SERVER01.CORP`; suffix membership flips the moment `.app`
+//! and `.dev` become both gTLDs and bundle-id endings.
+//!
+//! So every constant above is a prior tuned against the cases someone has
+//! thought of, and the numbered decisions in `mask_hosts` are the order
+//! those priors are applied in. Five rewrites in one sitting each fixed the
+//! previous round's defect and opened another one next door — the history is
+//! in `docs/testing.md`, and the honest reading of it is that this shape has
+//! run out of discriminating power rather than that the last exception has
+//! been found.
+//!
+//! What replaces it is context: mask what appears in host *position* — after
+//! `resolve`, `connect to`, `://`, `@`, `host=` — and, for structured records,
+//! use the field name, which this crate already knows and currently throws
+//! away before scrubbing. Tracked as its own change rather than a sixth patch.
+//!
 //! Free-form user prose. If your reporter types their employer's name into the
 //! description field, that is their disclosure to make — the crate's job is to
 //! ensure *it* did not add anything they did not choose to say.
@@ -319,7 +371,7 @@ impl Redactor {
             (secret_token_re(), "<redacted-token>"),
             // Before `labeled_secret_re`, which would otherwise consume the
             // `id=` and leave the identifier itself standing.
-            (machine_id_re(), "${1}${2}=<machine-id>"),
+            (machine_id_re(), "${1}${2}${3}<machine-id>"),
             (labeled_secret_re(), "${1}${2}${3}${4}=<redacted>"),
             (email_re(), "<email>"),
             (ssh_target_re(), "<ssh-target>"),
@@ -799,7 +851,11 @@ fn machine_id_re() -> &'static Regex {
               | serial(?:[-_\ ]?(?:number|no|num))?
               | udid
               | imei)
-              \s*[:=]?\s*
+              # The separator is CAPTURED and restored, not normalised. It was
+              # rewritten to `=` whatever the log actually said, which is the
+              # crate editing text it was only asked to redact — in a preview
+              # whose whole promise is that it shows what would leave.
+              (\s*[:=]?\s*)
               [A-Za-z0-9][A-Za-z0-9._:\-]{5,}
             ",
         )
@@ -883,21 +939,71 @@ fn private_host_re() -> &'static Regex {
     })
 }
 
-/// Apply [`private_host_re`], with the two guards a regex cannot express.
+/// Suffixes that are two labels wearing one job.
 ///
-/// The suffix list alone is not a sufficient discriminator, because a hostname
-/// and a reverse-DNS identifier are the same string in opposite orders:
+/// `co.uk` is a single public suffix. Counting it as two labels made
+/// `module.co.uk` look like a three-label FQDN when it is a bare registrable
+/// domain with nothing in front of it. A hand-written slice rather than the
+/// public suffix list: this crate depends on `regex` and nothing else, and the
+/// handful below covers the compound suffixes that actually appear.
+const COMPOUND_SUFFIXES: &[&str] = &[
+    "co.uk", "ac.uk", "org.uk", "gov.uk", "co.jp", "ne.jp", "or.jp", "com.au", "net.au", "com.br",
+    "co.nz", "co.za", "co.in", "com.cn", "com.mx", "com.tr",
+];
+
+/// Suffixes a reverse-DNS identifier actually begins with.
 ///
+/// Every two-letter ccTLD is a public suffix, so testing "the first label is a
+/// suffix" excused `us.internal.acme.com` — a corporate host, published whole.
+/// The roots an Android, Java or Apple identifier really starts with are a
+/// much smaller set, and none of them is two letters.
+///
+/// A reverse-DNS name under a ccTLD (`uk.co.example.app`) is therefore masked.
+/// That is the trade, and it runs the safe way: a mangled package path costs a
+/// round trip, a published hostname does not come back.
+const REVERSE_DNS_ROOTS: &[&str] = &["com", "org", "net", "edu", "gov", "mil", "int", "io", "dev"];
+
+/// The one private suffix that is also a real filename extension:
+/// `.env.local`, `settings.local`, `config.local`.
+///
+/// Only this one gets the two-label relaxation, and the list is deliberately
+/// as short as the evidence supports. Every entry here is a hole — `X.local`
+/// at two labels is kept unless `X` looks like a machine — so `private` was
+/// removed once it became clear that `keys.private` is a contrivance while
+/// `.env.local` is in every project. There is no `settings.corp` either:
+/// relaxing the private suffixes uniformly leaked `bastion.corp` and
+/// `vault.internal`, which are exactly the names the rule exists for.
+const WORDLIKE_PRIVATE_SUFFIXES: &[&str] = &["local"];
+
+/// Whether a label looks like it names a machine rather than a word.
+///
+/// A digit or a hyphen is the cheapest positive signal there is: `db01`,
+/// `web-3`, `ip-10-0-1-5`, `alices-macbook` all carry one, and `env`,
+/// `settings`, `keys`, `config` do not. It is what lets a two-label
+/// `X.local` be judged at all — and it is not an accident that the names
+/// which actually identify a person are the ones macOS and DHCP generate with
+/// hyphens in them.
+fn looks_like_a_machine(label: &str) -> bool {
+    label.contains('-') || label.bytes().any(|b| b.is_ascii_digit())
+}
+
+/// Apply [`private_host_re`], with the guards a regex cannot express.
+///
+/// The pattern is deliberately loose; every real decision is made here, with
+/// the match in hand. A hostname and a reverse-DNS identifier are the same
+/// string in opposite orders, and no amount of alternation settles that.
+///
+/// - **A suffix is only a suffix at the END.** `internal` and `corp` are a
+///   Kotlin visibility keyword and a routine Java package segment, so matching
+///   them anywhere destroyed every stack frame that contained one.
 /// - **A hostname ENDS with its suffix; an identifier BEGINS with one.**
-///   `bastion.corp.acme.com` versus `com.example.app`. Testing only the final
-///   label masked every Android, Java and Apple bundle id in a crash log,
-///   which is the first line a maintainer reads.
-/// - **A hostname is not a prefix of a longer dotted run.** `std.foo.io` inside
-///   `std.foo.io.println` matched, and the result — `<host>.println` — says
-///   less than either half of it did.
-///
-/// Neither is expressible in this engine, which has no lookaround, so both are
-/// decided here with the match in hand.
+///   `bastion.corp.acme.com` against `com.example.app`.
+/// - **A hostname is not a prefix of a longer dotted run.** `std.foo.io`
+///   inside `std.foo.io.println` matched, and `<host>.println` says less than
+///   either half did.
+/// - **Two labels is not enough on its own.** `local`, `home` and `private`
+///   are English words, and `.env.local` is in every Vite, Next and Django
+///   project there is. At two labels the name has to look like a machine.
 fn mask_hosts(text: &str) -> String {
     private_host_re()
         .replace_all(text, |caps: &regex::Captures<'_>| {
@@ -906,32 +1012,129 @@ fn mask_hosts(text: &str) -> String {
             };
             let found = matched.as_str();
             let labels: Vec<&str> = found.split('.').collect();
+            let keep = || found.to_string();
+            let mask = || "<host>".to_string();
 
-            // A private suffix anywhere is decisive; the guards below do not
-            // apply to it.
-            let is_private = labels.iter().any(|label| {
-                PRIVATE_SUFFIXES
-                    .iter()
-                    .any(|s| label.eq_ignore_ascii_case(s))
-            });
-            if is_private {
-                return "<host>".to_string();
+            let is = |label: &str, set: &[&str]| set.iter().any(|s| label.eq_ignore_ascii_case(s));
+            let Some(last) = labels.last() else {
+                return keep();
+            };
+
+            // A match that stops immediately before a `-` is a FRAGMENT of a
+            // longer token, not a name. The pattern's trailing group needs a
+            // `.` to continue, so `com.acme.internal-tools.util.Client` matched
+            // only `com.acme.internal` and was judged as if that were the whole
+            // thing — masking the front of an ordinary package path.
+            if text
+                .get(matched.end()..)
+                .is_some_and(|rest| rest.starts_with('-'))
+            {
+                return keep();
             }
 
-            let starts_with_a_suffix = labels
+            // The order below IS the rule. Each of the three preceding rounds
+            // on this function got it wrong by testing the right things in the
+            // wrong sequence.
+            //
+            // 1. A private suffix at the END settles it: `int.acme.corp` is a
+            //    host whatever it begins with. Checking the reverse-DNS escape
+            //    first gave a free pass to any host whose first label happened
+            //    to be a TLD.
+            if is(last, PRIVATE_SUFFIXES) {
+                // Two labels is enough unless the suffix is also a word, in
+                // which case the name has to look like a machine — see
+                // `WORDLIKE_PRIVATE_SUFFIXES`.
+                let relaxable = is(last, WORDLIKE_PRIVATE_SUFFIXES) && labels.len() <= 2;
+                return if !relaxable || labels.first().is_some_and(|l| looks_like_a_machine(l)) {
+                    mask()
+                } else {
+                    keep()
+                };
+            }
+
+            // 2. A CamelCase LAST label is a class name, so the run is a
+            //    package path. "Contains an uppercase letter anywhere" was
+            //    standing in for this and is not the same test: Windows and AD
+            //    hostnames are routinely capitalised, so it switched the rule
+            //    off on exactly the hosts it exists for.
+            //
+            //    CamelCase, not merely a leading capital — `.COM` and `.NET`
+            //    start with one too, and an operator who shouts the TLD is not
+            //    writing Java. A class name has a lowercase letter after it.
+            //    And a label that IS a suffix is a suffix however it is
+            //    cased. `Com` is CamelCase by shape and a TLD by meaning.
+            let camel_case = last.starts_with(|c: char| c.is_ascii_uppercase())
+                && last.chars().any(|c| c.is_ascii_lowercase())
+                && !is(last, HOST_SUFFIXES)
+                && !is(last, PRIVATE_SUFFIXES);
+            if camel_case {
+                return keep();
+            }
+
+            // 3. A private label MID-RUN, in a run that ends in neither a
+            //    private nor a public suffix: `bastion.corp.acme-inc`, an
+            //    internal root with no public TLD. Requiring a known final
+            //    label let every one of those through.
+            //
+            //    The exception is a genuine reverse-DNS package —
+            //    `com.acme.internal.util` — which begins with a suffix and
+            //    contains no label shaped like a machine. A hyphen or a digit
+            //    in there means `io.corp.acme-inc`, not `io.netty.internal`.
+            if labels.iter().any(|label| is(label, PRIVATE_SUFFIXES)) {
+                let reverse_dns = labels
+                    .first()
+                    .is_some_and(|first| is(first, REVERSE_DNS_ROOTS))
+                    && !labels.iter().any(|label| looks_like_a_machine(label));
+                return if reverse_dns { keep() } else { mask() };
+            }
+
+            // 4. A reverse-DNS identifier begins with the suffix a hostname
+            //    ends with: `com.example.app` against `bastion.corp.acme.com`.
+            if labels
                 .first()
-                .is_some_and(|first| HOST_SUFFIXES.iter().any(|s| first.eq_ignore_ascii_case(s)));
-            let continues_past_the_match = text
+                .is_some_and(|first| is(first, REVERSE_DNS_ROOTS))
+            {
+                return keep();
+            }
+
+            // Otherwise it has to end in a public suffix to be a host at all.
+            // The pattern's private alternative can match a run whose last
+            // label is neither — `com.foo.internal.Impl` — and that is a
+            // package path.
+            let compound = labels
+                .len()
+                .checked_sub(2)
+                .and_then(|at| labels.get(at))
+                .is_some_and(|penultimate| {
+                    let pair = format!("{penultimate}.{last}");
+                    COMPOUND_SUFFIXES
+                        .iter()
+                        .any(|s| pair.eq_ignore_ascii_case(s))
+                });
+            if !compound && !is(last, HOST_SUFFIXES) {
+                return keep();
+            }
+
+            // A prefix of a longer dotted run is part of that run, not a host.
+            let continues = text
                 .get(matched.end()..)
                 .and_then(|rest| rest.strip_prefix('.'))
                 .is_some_and(|rest| {
                     rest.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
                 });
+            if continues {
+                return keep();
+            }
 
-            if starts_with_a_suffix || continues_past_the_match {
-                found.to_string()
+            // Subdomains live to the LEFT of the registrable domain, so a bare
+            // `<name>.<suffix>` is a domain rather than a host, and two labels
+            // in front of a compound suffix is the same shape as three in
+            // front of a simple one.
+            let suffix_labels = if compound { 2 } else { 1 };
+            if labels.len().saturating_sub(suffix_labels) >= 2 {
+                mask()
             } else {
-                "<host>".to_string()
+                keep()
             }
         })
         .to_string()
@@ -1314,6 +1517,28 @@ mod tests {
     }
 
     #[test]
+    fn a_masked_identifier_keeps_the_separator_it_was_written_with() {
+        // The rule normalised whatever separator it matched to `=`, so
+        // `machine id: <uuid>` came back as `machine id=<machine-id>`. Small,
+        // but it is the crate rewriting text it was only asked to redact —
+        // and the reporter is being shown a preview of "what would leave".
+        let redactor = redactor();
+        for (input, expected) in [
+            (
+                "machine-id: 550e8400-e29b-41d4-a716-446655440000",
+                "machine-id: <machine-id>",
+            ),
+            (
+                "device_id=550e8400-e29b-41d4-a716-446655440000",
+                "device_id=<machine-id>",
+            ),
+            ("serial number C02XG2JMJGH8", "serial number <machine-id>"),
+        ] {
+            assert_eq!(redactor.scrub(input), expected, "{input:?}");
+        }
+    }
+
+    #[test]
     fn labelled_machine_identifiers_are_masked() {
         // A bare UUID stays: request and trace ids are UUIDs, they are the
         // thread a maintainer follows through a log, and masking them costs
@@ -1456,6 +1681,207 @@ mod tests {
         ] {
             assert_eq!(redactor.scrub(input), input, "bit a prefix out of a path");
         }
+    }
+
+    #[test]
+    fn a_private_suffix_mid_run_is_not_a_hostname() {
+        // `PRIVATE_SUFFIXES` matched ANY label anywhere and masked
+        // unconditionally, so `internal` and `corp` — a Kotlin visibility
+        // keyword and a routine Java package segment — destroyed every frame
+        // that contained one. The suffix has to be the LAST label to be a
+        // suffix at all.
+        let redactor = redactor();
+        for input in [
+            "at com.foo.internal.Impl",
+            "kotlin.internal.PlatformDependent",
+            "at com.corp.acme.Service",
+            "com.acme.internal.security.Token",
+        ] {
+            assert_eq!(redactor.scrub(input), input, "mangled a package path");
+        }
+    }
+
+    #[test]
+    fn a_dotfile_is_not_a_machine_on_the_local_network() {
+        // `local` is a filename extension as well as a private suffix, and
+        // `.env.local` is in every Vite, Next and Django project there is. Two
+        // labels alone is not enough to call something a host.
+        //
+        // Only `local`. Every entry in `WORDLIKE_PRIVATE_SUFFIXES` is a hole,
+        // so the list is as short as the evidence supports: `keys.private` is
+        // a contrivance and `safe.private` is a machine, so `private` is not
+        // on it.
+        let redactor = redactor();
+        for input in [
+            "cannot read .env.local",
+            "settings.local missing",
+            "loading config.local",
+        ] {
+            assert_eq!(redactor.scrub(input), input, "mangled a filename");
+        }
+    }
+
+    #[test]
+    fn a_machine_on_the_local_network_is_still_masked() {
+        // The other side of the same rule. Three labels is enough on its own;
+        // at two, the name has to look like a host — which the ones that
+        // actually identify someone do, because that is how macOS and DHCP
+        // generate them.
+        let redactor = redactor();
+        for (input, secret) in [
+            ("resolve bastion.internal.acme.corp", "acme"),
+            ("resolve ip-10-0-1-5.ec2.internal", "ip-10-0-1-5"),
+            ("resolve web.default.svc.cluster.local", "default"),
+            ("resolve alices-macbook.local failed", "alices-macbook"),
+            ("resolve db01.local failed", "db01"),
+        ] {
+            assert_gone(&redactor, input, secret);
+        }
+    }
+
+    #[test]
+    fn corporate_dns_without_a_public_tld_is_still_a_host() {
+        // A private root with no public suffix at the end — `bastion.corp.acme-inc`
+        // — is an ordinary corporate DNS shape. Requiring the last label to be
+        // a known suffix let every one of them through.
+        let redactor = redactor();
+        for (input, secret) in [
+            ("resolve bastion.corp.acme-inc failed", "acme-inc"),
+            ("resolve mydb.corp.deploys failed", "deploys"),
+            ("resolve vault.internal.subnet1 failed", "subnet1"),
+            ("resolve bastion.corp.acme-inc.com failed", "acme-inc"),
+        ] {
+            assert_gone(&redactor, input, secret);
+        }
+        // …while the reverse-DNS packages that share the shape stay. The
+        // discriminator is case: a hostname label is conventionally lowercase,
+        // and a class name is not.
+        for input in [
+            "at com.foo.internal.Impl",
+            "kotlin.internal.PlatformDependent",
+            "com.acme.internal.security.Token",
+        ] {
+            assert_eq!(redactor.scrub(input), input, "mangled a package path");
+        }
+    }
+
+    #[test]
+    fn a_capital_anywhere_does_not_make_a_host_a_class_name() {
+        // "contains an uppercase letter" was standing in for "is a class
+        // name", and one capital anywhere disabled the rule. Windows and AD
+        // hostnames are routinely capitalised, so it disabled it on exactly
+        // the hosts it exists for. What actually marks a package path is the
+        // LAST label being a class name.
+        let redactor = redactor();
+        for (input, secret) in [
+            ("resolve Bastion.internal.acme-inc failed", "acme-inc"),
+            ("resolve Server01.corp.acme-inc failed", "Server01"),
+            ("resolve BASTION.CORP.acme-inc failed", "acme-inc"),
+        ] {
+            assert_gone(&redactor, input, secret);
+        }
+    }
+
+    #[test]
+    fn a_shouted_tld_is_still_a_tld() {
+        // "Last label starts with a capital" was standing in for "is a class
+        // name", and an operator who types `.COM` — or a Windows event log
+        // that does — is not writing Java. A class name is CamelCase: it has a
+        // lowercase letter after the capital.
+        let redactor = redactor();
+        for (input, secret) in [
+            ("resolve bastion.internal.acme.NET", "acme"),
+            ("resolve bastion.internal.acme.Com", "acme"),
+            ("resolve bastion.corp.acme-inc.COM", "acme-inc"),
+        ] {
+            assert_gone(&redactor, input, secret);
+        }
+        assert_eq!(
+            redactor.scrub("at com.foo.internal.Impl"),
+            "at com.foo.internal.Impl"
+        );
+    }
+
+    #[test]
+    fn a_country_code_is_not_a_reverse_dns_root() {
+        // Every two-letter ccTLD is a public suffix, so "begins with a suffix"
+        // excused `us.internal.acme.com` — a corporate host, published whole.
+        // Reverse-DNS roots are a much smaller set than public suffixes.
+        let redactor = redactor();
+        for (input, secret) in [
+            ("resolve us.internal.acme.com", "acme"),
+            ("resolve de.internal.acme.com", "acme"),
+            ("resolve us.acme-inc.com", "acme-inc"),
+        ] {
+            assert_gone(&redactor, input, secret);
+        }
+        // …and the real reverse-DNS roots still excuse a package.
+        for input in ["at com.acme.internal.util", "at io.netty.internal.buffer"] {
+            assert_eq!(redactor.scrub(input), input, "mangled a package path");
+        }
+    }
+
+    #[test]
+    fn a_hyphen_after_a_suffix_means_the_run_is_longer() {
+        // `com.acme.internal-tools.util.Client` came back as
+        // `<host>-tools.util.Client`: the pattern stopped at `internal`,
+        // because its trailing group needs a `.`, and the fragment was judged
+        // as if it were the whole name.
+        let redactor = redactor();
+        let input = "at com.acme.internal-tools.util.Client";
+        assert_eq!(redactor.scrub(input), input, "masked a fragment of a path");
+    }
+
+    #[test]
+    fn a_leading_suffix_does_not_excuse_a_private_root() {
+        // The reverse-DNS escape hatch was checked before the suffix at the
+        // end, so any host whose first label happened to be a TLD got a free
+        // pass — including `int.acme.corp`, which ends in a private suffix and
+        // is unambiguously a host.
+        let redactor = redactor();
+        for (input, secret) in [
+            ("resolve int.acme.corp failed", "acme"),
+            ("resolve io.corp.acme-inc failed", "acme-inc"),
+        ] {
+            assert_gone(&redactor, input, secret);
+        }
+        // …and the reverse-DNS packages it is there for still survive.
+        assert_eq!(
+            redactor.scrub("at com.acme.internal.util"),
+            "at com.acme.internal.util"
+        );
+    }
+
+    #[test]
+    fn only_the_suffixes_with_a_filename_analog_are_relaxed() {
+        // The two-label relaxation exists because `.env.local` and
+        // `keys.private` are real files. There is no `settings.corp` or
+        // `keys.intranet`, so those suffixes get no such licence.
+        let redactor = redactor();
+        for (input, secret) in [
+            ("connect to bastion.corp failed", "bastion"),
+            ("connect to vault.internal failed", "vault"),
+            ("connect to gitlab.intranet failed", "gitlab"),
+            ("connect to db.lan failed", "db"),
+            ("connect to router.home failed", "router"),
+            ("connect to safe.priv failed", "safe"),
+        ] {
+            assert_gone(&redactor, input, secret);
+        }
+    }
+
+    #[test]
+    fn a_registrable_domain_under_a_compound_suffix_is_not_a_host() {
+        // `co.uk` is one suffix wearing two labels. Counting it as two made
+        // `module.co.uk` look like a three-label FQDN when it is a bare
+        // registrable domain with nothing in front of it.
+        let redactor = redactor();
+        assert_eq!(
+            redactor.scrub("module.co.uk is a thing"),
+            "module.co.uk is a thing"
+        );
+        // …and a real host under one still goes.
+        assert_gone(&redactor, "resolve db01.acme-inc.co.uk failed", "acme-inc");
     }
 
     #[test]

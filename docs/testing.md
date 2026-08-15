@@ -155,6 +155,83 @@ edition 2024, which that Cargo cannot parse. A declared-but-unverified MSRV is a
 *false* promise rather than a weak one: the suite stays green and the failure
 lands on a downstream who cannot tell it from their own mistake.
 
+## The reviewer who blocks the fix for the review
+
+The host rule went through three rounds in one sitting, and each round's fix
+opened the next round's defect:
+
+1. The suffix list alone masked every Java and Kotlin stack frame, because
+   `django.contrib.auth.models` is shaped like a hostname.
+2. The guards that fixed that masked `.env.local` and `com.foo.internal.Impl`,
+   because a private suffix was matched anywhere in the run.
+3. The relaxation that fixed *that* leaked `bastion.corp`, `vault.internal` and
+   `bastion.corp.acme-inc` — corporate DNS with no public suffix at the end,
+   which is precisely what the rule exists for.
+
+It did not stop at three. Rounds four and five each found two more leaks —
+`Bastion.internal.acme-inc` (any capital disabled the rule, and AD hostnames are
+capitalised), `int.acme.corp` (a leading TLD gave a free pass),
+`bastion.internal.acme.NET` (a shouted TLD), `us.internal.acme.com` (every
+ccTLD is a public suffix, so it read as a reverse-DNS root).
+
+Every one was found by a fresh adversarial review. **None was found by the
+tests the previous round had written.** That is the argument for reviewing the
+*fix* and not only the bug: each narrowing was correct about the case that
+motivated it and wrong about the case next door.
+
+### When to stop patching
+
+After five rounds a design review was asked a different question — not "what is
+still broken" but "is this converging?" The answer was no, and the evidence was
+the code: six constants, none of which carries information about hostnames as
+such. Each is a scar from one round's motivating case.
+
+A hostname and a reverse-DNS identifier are the same string in opposite orders.
+Over a context-free dotted token there is no discriminator that is not a prior,
+so every version of the rule must have both false positives and false
+negatives, and the only question is which corpus the prior is tuned against.
+Tuning it against an adversarial test set that grows every time the tuning
+changes is chasing a fixpoint that is not there.
+
+The rule as it stands is kept — it fixes five rounds of real leaks and real
+over-masking, and is strictly better than what preceded it — but it is now
+documented as a prior rather than a classifier, its two residual leaks are
+named at the module, and the replacement is #5 rather than a sixth patch here.
+
+The lesson worth carrying: **a run of fixes that each look obviously correct is
+itself evidence.** The question to ask after the third one is not "what did I
+miss" but "can this shape be right at all", and the thing to build before the
+answer is "no" is a differential test against real corpora — which would have
+surfaced the whole pattern on its first run.
+
+## No git-hook layer, deliberately
+
+Two org tooling systems want to own the hook layer, and the concern was that
+adopting both means two hook managers fighting with the loser's hooks silently
+not running. Checked rather than assumed: **there is no collision, and there is
+no hook layer here at all.**
+
+devkit's hooks are opt-in — `mkRustProject` takes `hooks ? null`, and with the
+default the whole branch is dead code. Even when a consumer opts in, devkit
+passes `install.enable = false` to git-hooks.nix specifically so it does *not*
+rewrite `.git/hooks` or `core.hooksPath`; it only maintains a config symlink.
+`.githooks/` belongs to devkit's workspace-scaffold template, not to
+`mkRustProject`. So nothing in squelch installs a hook today, and nothing would
+fight if something did.
+
+The one gate that looked genuinely additive — guardrails' `no-raw-trace-fields`,
+which stops raw `?`/`%` `tracing` formatters putting secrets into an audit trail
+— **matches nothing in this repo**. squelch has no `tracing` or `log`
+dependency and emits no logs of its own; it consumes an application's. Adopting
+it would be adding a gate that asserts nothing, which is the failure this
+document already spends a section on. It belongs in the README as advice to
+consumers, and that is where it is.
+
+What a hook layer would add over the nine flake checks is faster local feedback
+on checks that already run, plus commit-message and branch-name shape. Neither
+is worth a second config to keep in sync for a crate this size. Enabling
+devkit's set later is a one-line `hooks = { … }` if that changes.
+
 ## Supply chain
 
 `deny.toml` turns on `cargo deny check` — advisories, licences, bans, sources.

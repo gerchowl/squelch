@@ -91,7 +91,7 @@ pub fn build(destination: &Destination, template: &str, fields: &[(&str, String)
                 dropped.push((*id).to_string());
                 continue;
             }
-            encoded = truncate_encoded(&encoded, room);
+            encoded = truncate_encoded(value, room);
             // With room for only one or two characters and a value beginning
             // with a `%XX` escape, `truncate_encoded` walks the cut to zero and
             // the field would ship as nothing but the note. That is a dropped
@@ -117,24 +117,28 @@ pub fn build(destination: &Destination, template: &str, fields: &[(&str, String)
 }
 
 /// Cut an already-encoded string without splitting a `%XX` triplet.
-fn truncate_encoded(encoded: &str, room: usize) -> String {
-    let mut cut = encoded.len().min(room);
-    let bytes = encoded.as_bytes();
-    while cut > 0 {
-        // `get` rather than an index: `cut` is derived from `encoded.len()`
-        // so the range is always valid, but a panic here would fire while
-        // building a bug report, which is the worst possible moment for the
-        // tool to crash a second time.
-        let Some(tail) = bytes.get(cut.saturating_sub(2)..cut) else {
-            break;
-        };
-        if tail.contains(&b'%') {
-            cut -= 1;
-        } else {
+/// The longest percent-encoded prefix of `value` that fits in `room` bytes,
+/// cut only between whole characters.
+///
+/// Built up from the source rather than cut down from the encoded string,
+/// which is what makes it correct by construction. Trimming the encoded form
+/// needs a guard against landing inside a `%XX` triple — and that guard is
+/// weaker than it looks, because a multi-byte character is SEVERAL consecutive
+/// triples. `é` is `%C3%A9`; a cut between them leaves `%C3`, which is a whole
+/// escape and a broken codepoint. The reporter was told "shortened", not "the
+/// tail no longer decodes", and what a server does with an invalid parameter
+/// is its business rather than ours.
+fn truncate_encoded(value: &str, room: usize) -> String {
+    let mut out = String::new();
+    let mut buffer = [0u8; 4];
+    for character in value.chars() {
+        let piece = encode(character.encode_utf8(&mut buffer));
+        if out.len() + piece.len() > room {
             break;
         }
+        out.push_str(&piece);
     }
-    encoded[..cut].to_string()
+    out
 }
 
 /// Percent-encode a query value.
@@ -307,6 +311,79 @@ mod tests {
             "a dropped field must not appear in the URL: {}",
             built.url
         );
+    }
+
+    /// Percent-decode to RAW BYTES.
+    ///
+    /// Bytes, not a `String`: `from_utf8_lossy` repairs exactly the corruption
+    /// this is looking for, so a decoder that returns a `String` cannot see it.
+    fn percent_decode_bytes(encoded: &str) -> Vec<u8> {
+        let bytes = encoded.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut index = 0;
+        while index < bytes.len() {
+            match bytes.get(index) {
+                Some(b'%') if index + 2 < bytes.len() => {
+                    match u8::from_str_radix(&encoded[index + 1..index + 3], 16) {
+                        Ok(byte) => {
+                            out.push(byte);
+                            index += 3;
+                        }
+                        Err(_) => {
+                            out.push(b'%');
+                            index += 1;
+                        }
+                    }
+                }
+                Some(byte) => {
+                    out.push(*byte);
+                    index += 1;
+                }
+                None => break,
+            }
+        }
+        out
+    }
+
+    fn parameter(url: &str, id: &str) -> Option<String> {
+        let needle = format!("&{id}=");
+        let start = url.find(&needle)? + needle.len();
+        Some(url[start..].split('&').next().unwrap_or("").to_string())
+    }
+
+    #[test]
+    fn truncation_never_splits_a_character() {
+        // Not splitting a `%XX` escape is a WEAKER property than not splitting
+        // a character, and the rule only had the weaker one. `é` encodes as
+        // `%C3%A9`; a cut between the two triples leaves `%C3`, which is a
+        // whole escape and a broken codepoint — a lead byte with no
+        // continuation. The reporter is told "shortened", not "the tail is now
+        // undecodable", and what GitHub does with an invalid parameter is its
+        // business rather than ours.
+        //
+        // The values below straddle every alignment of the cut against a
+        // three-byte and a two-byte character.
+        for pad in 0..12 {
+            for tail in ["é", "€", "🙂"] {
+                let value = format!("{}{}", "x".repeat(pad), tail.repeat(3_000));
+                let built = build(&destination(), "bug.yml", &[("impact", value.clone())]);
+                let Some(encoded) = parameter(&built.url, "impact") else {
+                    continue;
+                };
+                let decoded = percent_decode_bytes(&encoded);
+                let text = std::str::from_utf8(&decoded).unwrap_or_else(|err| {
+                    panic!("pad={pad} tail={tail:?}: truncated value is not UTF-8: {err}")
+                });
+                // And it must be a PREFIX of what was supplied, plus the note.
+                // Validity alone would be satisfied by a re-encoding that
+                // silently substituted a replacement character.
+                let without_note = text.split("\n\n[shortened").next().unwrap_or(text);
+                assert!(
+                    value.starts_with(without_note),
+                    "pad={pad} tail={tail:?}: what survived is not a prefix of what was given"
+                );
+            }
+        }
     }
 
     #[test]

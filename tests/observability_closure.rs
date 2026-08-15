@@ -373,6 +373,34 @@ proptest! {
                 continue;
             }
 
+            // Whatever survived must still be text. Truncation cutting between
+            // two `%XX` triples of the SAME character leaves a lead byte with
+            // no continuation — a whole escape and a broken codepoint — and the
+            // manifest reports that as "shortened", which is not what happened.
+            let surviving = observed
+                .url
+                .find(&parameter)
+                .map(|at| &observed.url[at + parameter.len()..])
+                .and_then(|rest| rest.split('&').next())
+                .unwrap_or("");
+            let decoded = percent_decode(surviving);
+            let text = std::str::from_utf8(&decoded);
+            prop_assert!(
+                text.is_ok(),
+                "{id} was truncated between two bytes of one character: {:?}",
+                text.err()
+            );
+            // Validity alone is not enough — a re-encoding that substituted a
+            // replacement character would satisfy it. What survived has to be
+            // a prefix of what was given.
+            if let Ok(text) = text {
+                let without_note = text.split("\n\n[shortened").next().unwrap_or(text);
+                prop_assert!(
+                    value.starts_with(without_note),
+                    "{id} came back as something other than a prefix of itself"
+                );
+            }
+
             // Present. Either it survived whole, or it is a stub — and a stub
             // must say so.
             let fully_present =
@@ -445,6 +473,10 @@ proptest! {
 /// parameter is located and decoded back. Written against the contract — "the
 /// query parameter's value decodes to what was supplied" — rather than by
 /// calling the encoder, which would agree with an encoder that is wrong.
+///
+/// Raw BYTES, never `from_utf8_lossy`: that call repairs a truncation which
+/// split a character, which is precisely the corruption worth catching. A
+/// decoder returning a `String` cannot see the bug it is being used to find.
 fn carries_whole_value(url: &str, id: &str, value: &str) -> bool {
     let needle = format!("&{id}=");
     let Some(start) = url.find(&needle) else {
@@ -452,10 +484,10 @@ fn carries_whole_value(url: &str, id: &str, value: &str) -> bool {
     };
     let rest = &url[start + needle.len()..];
     let encoded = rest.split('&').next().unwrap_or("");
-    percent_decode(encoded) == value
+    percent_decode(encoded) == value.as_bytes()
 }
 
-fn percent_decode(encoded: &str) -> String {
+fn percent_decode(encoded: &str) -> Vec<u8> {
     let bytes = encoded.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut index = 0;
@@ -481,7 +513,7 @@ fn percent_decode(encoded: &str) -> String {
             None => break,
         }
     }
-    String::from_utf8_lossy(&out).into_owned()
+    out
 }
 
 proptest! {
