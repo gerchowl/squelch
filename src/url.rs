@@ -16,17 +16,26 @@ use crate::destination::Destination;
 
 /// Hard ceiling on the whole URL.
 ///
-/// Measured against github.com (2026-09-30): 4 079 chars answered 302,
-/// 7 079 returned 500, 8 279+ returned 414. With a logged-in browser's cookies
-/// the 500 zone starts near 6 000. Browsers tolerate far more — Chrome and
-/// Firefox handle roughly 32 KB — but GitHub's server cap bites first.
+/// Measured against github.com (2026-09-30), bisected by request length:
 ///
-/// 4 200 leaves a comfortable margin below the cookie-adjusted ceiling. The
-/// same measurement should be re-checked periodically; GitHub moves this limit.
+/// | request | response |
+/// | --- | --- |
+/// | bare `curl`, ≤ 7 067 chars | normal (404 logged-out login wall) |
+/// | bare `curl`, 7 068 – 8 000 | **500** |
+/// | 8 200+ | 414 |
+/// | with a well-formed 2 KB `Cookie` header | **500 from 6 000** |
 ///
-/// **Measured, not guessed.** A prior reader (issue #6) could not verify the
-/// number against the original measurement; the data is recorded here so it is
-/// always checkable.
+/// The limit applies to the whole request, headers included, which is why the
+/// bare figure is the wrong one to design against: a logged-in browser sends
+/// several KB of cookies, so the 500 zone starts near 6 000 for an actual
+/// reporter. 4 200 leaves a comfortable margin below that.
+///
+/// **Re-check this periodically.** GitHub moves the limit, and a constant with
+/// no date next to it cannot be re-measured by whoever finds it next — which is
+/// how 7 500 sat above the 7 079 failure point for as long as it did, with the
+/// measurement quoted directly above it and a conclusion that contradicted it
+/// (issue #6). The date and method are recorded here so the next reader can
+/// repeat the measurement rather than trust the number.
 pub const MAX_URL_LEN: usize = 4_200;
 
 /// A built URL, and whether anything was lost building it.
@@ -442,5 +451,74 @@ mod tests {
         assert!(is_safe_to_open(
             "https://github.com/o/r/issues/new?template=bug.yml&a=b%20c"
         ));
+    }
+
+    /// The only test that can see the class of bug `MAX_URL_LEN` is a number
+    /// for.
+    ///
+    /// Every other test here checks the string squelch *built*. None checks
+    /// what github.com *does with it*, which is how 7 500 sat above the
+    /// measured failure point while the whole suite stayed green — the same
+    /// blind spot as the missing `bug.yml` in #1, one level further out.
+    ///
+    /// Needs the network, so it is `#[ignore]`d and `nix flake check` stays
+    /// hermetic. Needs `endpoint`, because the only TLS client this crate has
+    /// is the one behind that feature — a raw `TcpStream` to :443 gets its
+    /// connection reset by the handshake.
+    ///
+    /// ```sh
+    /// cargo test --all-features -- --ignored live_url_budget
+    /// ```
+    ///
+    /// Sends a 2 KB cookie, because the bare request is not the case that
+    /// matters. The ceiling applies to the whole request, and a logged-in
+    /// reporter's browser carries several KB of cookies — measured 2026-10-01,
+    /// the bare request still answers 404 at 7 072 characters while the same
+    /// URL with a 2 KB cookie already 500s at 7 132.
+    #[cfg(feature = "endpoint")]
+    #[test]
+    #[ignore = "needs the network and the `endpoint` feature; run deliberately"]
+    fn live_url_budget_is_under_the_real_failure_point() {
+        let built = build(
+            &destination(),
+            "bug.yml",
+            &[("current-behavior", "x".repeat(MAX_URL_LEN))],
+        );
+        assert_eq!(
+            built.url.len(),
+            MAX_URL_LEN,
+            "the budget should be filled exactly, so this tests the real edge"
+        );
+
+        let cookie = format!("_octo={}", "b".repeat(2_048));
+        let response = ureq::get(&built.url)
+            .set("Cookie", &cookie)
+            .set("Accept", "text/html")
+            .call();
+
+        let status: u16 = match &response {
+            Ok(r) => r.status(),
+            // A transport error is not a 5xx, but it is not a working route
+            // either: `Sent::Opened` would claim the form opened.
+            Err(ureq::Error::Status(code, _)) => *code,
+            Err(err) => panic!("{built:?} did not reach github.com: {err}"),
+        };
+
+        assert!(
+            !(500..600).contains(&status),
+            "github.com returned {status} for a URL of exactly MAX_URL_LEN \
+             ({} chars) carrying a 2 KB cookie — the budget is above the real \
+             failure point, and Transport::Browser would report success. \
+             Re-measure and lower MAX_URL_LEN; the method is in its doc comment.",
+            built.url.len(),
+        );
+        assert_ne!(
+            status, 414,
+            "github.com returned 414 — the request URI is too long for the \
+             server, so MAX_URL_LEN is too high"
+        );
+        // Not an assertion about a *correct* response: logged out, GitHub
+        // answers 404 for the login wall. The point is only that it is not a
+        // server error, so a 5xx here means the budget, not the test.
     }
 }
