@@ -225,7 +225,14 @@ pub fn canary_log_file(dir: &Path) -> PathBuf {
 /// so the capture file cannot be line-delimited.
 const ARG_SEP: char = '\u{1e}';
 
-/// A stand-in binary on `PATH` that records the argv it was called with.
+/// Suffix of the file the shim writes its stdin to.
+///
+/// `gh` receives the report body over stdin (`--body-file -`), so argv alone no
+/// longer contains the payload — and the leak assertions are about the payload.
+pub const STDIN_SUFFIX: &str = ".stdin";
+
+/// A stand-in binary on `PATH` that records the argv it was called with, and
+/// whatever it was sent on stdin.
 pub struct Shim {
     pub dir: PathBuf,
     pub capture: PathBuf,
@@ -243,6 +250,12 @@ impl Shim {
     /// [`run_demo_with`] puts the directory on the *child's* `PATH` instead,
     /// which is race-free and closer to what a real invocation looks like.
     pub fn install(name: &str, exit_code: i32) -> Self {
+        Self::install_with_stderr(name, exit_code, "")
+    }
+
+    /// As [`Shim::install`], but the shim also writes `stderr` and exits with
+    /// it — the shape a real `gh` failure has.
+    pub fn install_with_stderr(name: &str, exit_code: i32, stderr: &str) -> Self {
         let dir = scratch(&format!("shim-{name}"));
         let capture = dir.join("argv");
         let script = dir.join(name);
@@ -252,9 +265,12 @@ impl Shim {
             format!(
                 "#!/bin/sh\n\
                  for a in \"$@\"; do printf '%s' \"$a\"; printf '\\036'; done >> '{}'\n\
+                 cat >> '{}'{STDIN_SUFFIX}\n\
+                 printf '%s' '{stderr}' >&2\n\
                  printf 'https://github.com/gerchowl/squelch/issues/1\\n'\n\
                  exit {exit_code}\n",
-                capture.display()
+                capture.display(),
+                capture.display(),
             ),
         )
         .expect("write shim");
@@ -276,6 +292,17 @@ impl Shim {
             .filter(|s| !s.is_empty())
             .map(str::to_string)
             .collect()
+    }
+
+    /// Everything the shim was sent on stdin.
+    ///
+    /// The `gh` route's payload arrives here rather than in argv — which is
+    /// the point of `--body-file -`: the report is no longer readable from the
+    /// process list, and is not subject to the 32 KB Windows command-line cap.
+    pub fn stdin(&self) -> String {
+        let mut path = self.capture.clone().into_os_string();
+        path.push(STDIN_SUFFIX);
+        std::fs::read_to_string(PathBuf::from(path)).unwrap_or_default()
     }
 
     pub fn was_called(&self) -> bool {
