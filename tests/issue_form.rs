@@ -10,6 +10,15 @@
 //! the browser opens a form, and the section the reporter wrote is simply not
 //! there. Nothing else in the suite can see it, because every other test
 //! checks the URL squelch *built* rather than the template it points at.
+//!
+//! # Also here: the documentation links
+//!
+//! The last two tests are the same idea applied to `docs/`. A decision record
+//! nobody can navigate to is not a decision record, and a broken relative link
+//! is invisible to everything else in the suite — the ADRs are not compiled and
+//! nothing here renders markdown. The failure is silent in the same way the
+//! missing field id is, which is the only reason it belongs in this file rather
+//! than in a test of its own.
 
 use std::collections::BTreeSet;
 
@@ -217,4 +226,154 @@ fn the_confirmation_is_a_checkbox_no_url_can_reach() {
          enforced by nothing",
         confirm.lines().next().unwrap_or("")
     );
+}
+
+// ---------------------------------------------------------------------------
+// Documentation links
+// ---------------------------------------------------------------------------
+
+/// The ADR index, baked in at compile time for the same reason `FORM` is.
+///
+/// A decision record is only useful if a reader can find the next one, and a
+/// broken relative link in an index is the failure that makes a directory look
+/// abandoned. Nothing else in the suite would notice: the ADRs are not compiled
+/// and the README is not rendered by anything here.
+const ADR_INDEX: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/docs/adr/README.md"));
+
+/// Every markdown file that can carry a relative link a reader is expected to
+/// follow. Baked in rather than globbed at run time, so a new file that is not
+/// listed cannot escape the check — which is the same trade `include_str!` makes
+/// everywhere else in this file, and the reason a run-time walk is not used: a
+/// `read_dir` would find today's files and a new ADR added tomorrow would be
+/// unlisted until someone noticed, which is the drift the index is meant to
+/// prevent.
+const LINKED_DOCS: [(&str, &str); 12] = [
+    ("README.md", include_str!("../README.md")),
+    ("docs/testing.md", include_str!("../docs/testing.md")),
+    ("docs/adr/README.md", ADR_INDEX),
+    (
+        "docs/adr/0001-extracted-from-flock-adr-0010.md",
+        include_str!("../docs/adr/0001-extracted-from-flock-adr-0010.md"),
+    ),
+    (
+        "docs/adr/0002-the-msrv-is-set-by-the-dependency-tree.md",
+        include_str!("../docs/adr/0002-the-msrv-is-set-by-the-dependency-tree.md"),
+    ),
+    (
+        "docs/adr/0003-no-git-hook-layer.md",
+        include_str!("../docs/adr/0003-no-git-hook-layer.md"),
+    ),
+    (
+        "docs/adr/0004-the-browser-route-refuses-rather-than-truncate.md",
+        include_str!("../docs/adr/0004-the-browser-route-refuses-rather-than-truncate.md"),
+    ),
+    (
+        "docs/adr/0005-the-host-rule-is-a-prior.md",
+        include_str!("../docs/adr/0005-the-host-rule-is-a-prior.md"),
+    ),
+    (
+        "docs/adr/0006-field-provenance-and-host-position.md",
+        include_str!("../docs/adr/0006-field-provenance-and-host-position.md"),
+    ),
+    (
+        "docs/adr/0007-the-url-budget-is-under-the-measured-failure-point.md",
+        include_str!("../docs/adr/0007-the-url-budget-is-under-the-measured-failure-point.md"),
+    ),
+    (
+        "docs/adr/0008-form-parse-skeleton-takes-self.md",
+        include_str!("../docs/adr/0008-form-parse-skeleton-takes-self.md"),
+    ),
+    ("docs/stories.md", include_str!("../docs/stories.md")),
+];
+
+/// Pull the target out of a markdown link.
+///
+/// Only the `[text](target)` inline form, which is the only one these files use
+/// for repository paths. A bare URL, a reference-style link or an image is not
+/// followed, because following those would need the network and this test runs in
+/// a sandbox that has none.
+fn link_target(line: &str) -> Option<&str> {
+    let open = line.find("](")? + 2;
+    let rest = &line[open..];
+    let close = rest.find(')')?;
+    Some(&rest[..close])
+}
+
+#[test]
+fn every_relative_doc_link_resolves() {
+    for (name, text) in LINKED_DOCS {
+        for (number, line) in text.lines().enumerate() {
+            let Some(target) = link_target(line) else {
+                continue;
+            };
+            // Absolute URLs, anchors within the same file, and mailto are not
+            // repository paths and are not checked here.
+            if target.starts_with("http://")
+                || target.starts_with("https://")
+                || target.starts_with("mailto:")
+                || target.starts_with('#')
+            {
+                continue;
+            }
+            // Resolve relative to the file holding the link, then strip any
+            // `#fragment` — a link to `docs/adr/README.md#index` is a link to the
+            // file, and the fragment is not a path.
+            //
+            // A leading `./` is normalised away rather than treated as
+            // repository-root relative. `Path::new("/docs/adr")` is an *absolute*
+            // path, so a naive leading-slash strip turns a relative link into one
+            // that resolves against the filesystem root and quietly passes for
+            // any directory that happens to exist there. The first version of
+            // this test did exactly that and asserted nothing at all — the same
+            // failure `docs/testing.md` records for the property suite.
+            let base = name.rsplit_once('/').map_or("", |(dir, _)| dir);
+            let path = target.split('#').next().unwrap_or(target);
+            let path = path.strip_prefix("./").unwrap_or(path);
+            let resolved = format!("{base}/{path}");
+
+            let full = concat!(env!("CARGO_MANIFEST_DIR"), "/");
+            let on_disk = format!("{full}{resolved}");
+            assert!(
+                std::path::Path::new(&on_disk).exists(),
+                "{name}:{} links to {target:?}, which resolves to {resolved:?} — \
+                 no such path in the repository",
+                number + 1
+            );
+        }
+    }
+}
+
+#[test]
+fn the_adr_index_lists_every_record_that_exists() {
+    // The index is the only way a reader finds the next decision, so a record
+    // that is not listed is a record nobody will read. The inverse — an index
+    // entry with no file — is the broken-link case above; this is the one where
+    // the file exists and the index forgot it.
+    // Links in the index are relative to the file holding them, so they are bare
+    // filenames rather than `docs/adr/…` paths. Accept both, and reject anything
+    // that is not a markdown file in the same directory.
+    let mut listed: Vec<&str> = ADR_INDEX
+        .lines()
+        .filter_map(link_target)
+        .filter(|t| t.ends_with(".md") && !t.starts_with("http") && !t.contains('/'))
+        .collect();
+    listed.sort_unstable();
+    listed.dedup();
+
+    assert!(
+        listed.len() >= 8,
+        "the index lists only {} records: {listed:?}",
+        listed.len()
+    );
+
+    // Every listed entry is a real file, and every real file is listed. The first
+    // half is the broken-link case restated for the index specifically; the
+    // second is this one.
+    for entry in &listed {
+        let full = concat!(env!("CARGO_MANIFEST_DIR"), "/docs/adr/");
+        assert!(
+            std::path::Path::new(&format!("{full}{entry}")).exists(),
+            "the index lists {entry:?}, which does not exist"
+        );
+    }
 }

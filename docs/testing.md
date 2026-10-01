@@ -5,6 +5,11 @@ already on a public tracker. So the test suite is built to answer one question â
 **what actually left the machine?** â€” rather than to check that the builder
 returns the right struct.
 
+This document is the *how*. Why a decision was made at all is in
+[`docs/adr/`](adr/); the two are kept apart deliberately, and where they overlap
+the ADRs win. An ADR that restated this file would be a second copy to drift, and
+a section here arguing *why* would be a decision record in the wrong place.
+
 ## Four layers
 
 | layer | where | what it can catch |

@@ -228,6 +228,15 @@ Early. The redaction rules have been exercised against a real ~10k-line producti
 
 Four gaps in the scrubber are decisions rather than oversights, and are written down at the rules themselves: **encoded secrets** (a base64 or `\u`-escaped token matches nothing — the labelled-secret rule catches the JSON error bodies that carry them in practice), **hosts on suffixes outside the list** the FQDN rule tests against, **a bare `<word>.local` in free text**, and **a non-English message**, where the position anchors do not apply. The first is a cost that buys a bounded search; the other three are the residue of a problem that cannot be solved from string shape alone, and the section above says why.
 
+## Why things are the way they are
+
+[`docs/adr/`](docs/adr/) records the decisions a later reader would otherwise reverse
+without knowing the reasoning — which host rule exists and why there is no sixth
+version of it, where the 4 200-character URL budget came from and how to re-measure
+it, what squelch inherited from [flock](https://github.com/gerchowl/flock) ADR-0010
+and where it has diverged. [`docs/testing.md`](docs/testing.md) covers the *how* the
+suite is built, including which of its tests were found vacuous.
+
 ## License
 
 MIT OR Apache-2.0
