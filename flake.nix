@@ -42,6 +42,12 @@
             extraSrcFiles = [
               ".github/ISSUE_TEMPLATE/bug.yml"
               "README.md"
+              # `tests/issue_form.rs` also asserts that every relative link in the
+              # README and the ADR index resolves, so the ADRs have to be in the
+              # sandbox. A `docs/` path missing here fails the check on a file
+              # nobody changed, which is the same class of surprise as the missing
+              # `bug.yml` above.
+              "docs"
             ];
             # The same project at the MSRV `Cargo.toml` declares, for one
             # question only: does it still compile there?
