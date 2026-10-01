@@ -121,6 +121,8 @@
 pub mod destination;
 pub mod error;
 pub mod form;
+#[cfg(feature = "panic-hook")]
+pub mod panic;
 pub mod provenance;
 pub mod redact;
 pub mod report;
