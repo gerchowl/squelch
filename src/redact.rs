@@ -39,6 +39,42 @@
 //! - identifiers *labelled* as naming the machine — `machine-id`, `serial`,
 //!   `udid`, `imei`
 //!
+//! # Hostnames: three signals, and why there are three
+//!
+//! A hostname and a reverse-DNS package identifier are **the same string in
+//! opposite orders** — `bastion.corp.acme.com` against `com.example.app` — and
+//! over a context-free dotted token there is no discriminator that is not itself
+//! a prior. Shape cannot do it, and neither can length, nor case (Java breaks
+//! convention with `com.foo.internal.Impl`, DNS with `SERVER01.CORP`), nor
+//! suffix membership (`.app` and `.dev` are both gTLDs and both common endings
+//! of module paths).
+//!
+//! That is not a gap to be closed by a better shape rule. It is why
+//! `mask_hosts` was rewritten **five times**, each round correct about the case
+//! that motivated it and wrong about the case next door, and why the fifth round
+//! was not the last. `mask_hosts` is still there and still a prior — but it is
+//! now the *last* of three, not the only one, because two better signals were
+//! sitting unused.
+//!
+//! | signal | where | what it knows |
+//! |---|---|---|
+//! | `scrub_value` | a field called `host`, `remote`, `upstream` | the value **is** a name, by contract |
+//! | the anchored rules | after `resolve `, `connect to `, inside `host=` | nothing else goes in that position |
+//! | `mask_hosts` | anywhere | shape — a prior, and the only one of the three |
+//!
+//! The first two are not heuristics and do not need a corpus. A field called
+//! `host` holds a hostname by the contract of its name, and a name after
+//! `resolve` is a name whatever it is made of. That is what finally reaches the
+//! case the shape rule structurally cannot:
+//!
+//! ```text
+//! resolve bastion          →  resolve <host>
+//! ```
+//!
+//! A **single-label** name. There is no dot to build a dotted run out of, so no
+//! amount of shape analysis finds it, and it is the machine's own name — the
+//! most identifying thing in the line. It leaked under every previous version.
+//!
 //! # What it deliberately does not cover
 //!
 //! **Encoded secrets.** A base64, hex or `\u`-escaped token matches nothing
@@ -59,21 +95,45 @@
 //! `bastion.corp.acme.com` from `django.contrib.auth.models` — they have the
 //! same shape, and masking the second cost a Django traceback the line that
 //! says where the bug is. A host under a suffix not on that list is not
-//! matched by *this* rule; the private-suffix, `user@host` and git-remote
-//! rules are what cover the shapes that carry a name in practice.
+//! matched by *this* rule; the field-name and position rules, the
+//! private-suffix rule, `user@host` and the git-remote rule are what cover the
+//! shapes that carry a name in practice.
 //!
-//! **A bare two-label `<word>.local` or `<word>.private`.** `printer.local` is
-//! kept, because `.env.local`, `settings.local` and `keys.private` are the same
-//! shape and are in every project there is. At two labels a name under one of
-//! those two suffixes has to *look* like a machine — a digit or a hyphen —
-//! before it is treated as one. That is a narrower loss than it sounds: the
-//! names which actually identify a person are the ones macOS and DHCP
-//! generate, and those carry hyphens (`alices-macbook.local` is masked).
+//! **A bare two-label `<word>.local` or `<word>.private` in free text.**
+//! `printer.local` is kept, because `.env.local`, `settings.local` and
+//! `keys.private` are the same shape and are in every project there is. At two
+//! labels a name under one of those two suffixes has to *look* like a machine —
+//! a digit or a hyphen — before it is treated as one. That is a narrower loss
+//! than it sounds: the names which actually identify a person are the ones macOS
+//! and DHCP generate, and those carry hyphens (`alices-macbook.local` is
+//! masked).
+//!
+//! The same name in a field called `host` **is** masked, and the same name after
+//! `resolve ` **is** masked. This gap is now confined to the one place it has to
+//! live: free text with no position signal and no field name. That is the
+//! smallest region it can be confined to, which is the argument for the two new
+//! rules rather than a sixth attempt at the shape.
 //!
 //! Only those two suffixes. There is no `settings.corp` or `keys.intranet`, so
 //! `bastion.corp`, `vault.internal` and `db.lan` are masked at two labels like
 //! anything else — relaxing every private suffix uniformly leaked exactly the
 //! names the rule exists for.
+//!
+//! **A bare public FQDN in prose with no verb in front of it.**
+//! `the server at build01.foo_bar.example.com is down` survives unless the
+//! sentence says `resolve` or `connect to`. This is the cost of relying on
+//! position, and it is stated here rather than left to be discovered: a public
+//! hostname in an error message is a far smaller disclosure than a corporate
+//! one, and the alternative — a shape rule broad enough to catch it — is the
+//! rule that ate `django.contrib.auth.models` in the first place.
+//!
+//! **A non-English message.** The anchors are English and
+//! configuration-file conventions: `Could not resolve` is one resolver's
+//! wording, and a library that phrases it differently gets no help from the
+//! position rules. A guarantee that quietly depends on the reporter's locale is
+//! not a guarantee, so this is a documented limit rather than an implied one.
+//! The field-name rule is locale-independent, which is one more reason to prefer
+//! it where the application can supply it.
 //!
 //! The trade runs the other way too, and two losses are accepted on purpose:
 //!
@@ -83,7 +143,8 @@
 //! - A module path from an ecosystem that does *not* use reverse-DNS, with a
 //!   private-suffix word in the middle — `myapp.internal.helpers` — is masked.
 //!   It is indistinguishable from `bastion.corp.acme-inc`, and only one of the
-//!   two is recoverable when the rule guesses wrong.
+//!   two is recoverable when the rule guesses wrong. It survives in a `message`
+//!   field, and in any field not named for a host.
 //!
 //! A filename or a frame costs a round trip; a hostname does not come back.
 //!
@@ -157,7 +218,26 @@ pub const DEFAULT_ALLOWED_FIELDS: &[&str] = &[
 /// `err` is the single most diagnostic field in a bug report — dropping it
 /// leaves records that say only "something failed" — so it is scrubbed rather
 /// than discarded.
-pub const DEFAULT_SCRUBBED_FIELDS: &[&str] = &["message", "msg", "error", "err"];
+///
+/// The network-name fields are here for the same reason, and the entry is only
+/// safe **because** [`Redactor::scrub_value`] exists. Before it, a `host` field
+/// had to be either dropped or published, and publishing it meant guessing from
+/// the shape of a token that is indistinguishable from a module path — the
+/// position five rounds of `mask_hosts` failed to resolve. Now the field name is
+/// the evidence, so the value can be carried and masked with certainty: what
+/// reaches the report is `host="<host>"`, which tells a maintainer that a
+/// network name was involved and discloses nothing about which one.
+///
+/// This is a privacy decision, like every other entry here — adding a field is
+/// not a formatting choice. It runs the safe way: the value is masked by a rule
+/// that is *more* aggressive in this field than anywhere else, so the worst case
+/// is a report carrying `<host>` where it might have carried nothing.
+pub const DEFAULT_SCRUBBED_FIELDS: &[&str] = &[
+    "message", "msg", "error", "err",
+    // Field-provenance fields. A value in one of these is a network name by
+    // contract, so it is masked by name rather than by shape.
+    "host", "hostname", "remote", "peer", "addr", "address", "endpoint", "server", "upstream",
+];
 
 /// Cap on any single retained value, in characters.
 const MAX_VALUE_CHARS: usize = 1_024;
@@ -319,6 +399,79 @@ impl Redactor {
 
     /// Scrub a single string.
     pub fn scrub(&self, value: &str) -> String {
+        self.scrub_value(None, value)
+    }
+
+    /// Scrub a value that arrived in a named field.
+    ///
+    /// The field name is the decisive signal the crate already has and was
+    /// throwing away. Over a context-free dotted token there is no
+    /// discriminator between a hostname and a reverse-DNS package — they are
+    /// the same string in opposite orders — so any rule working from shape
+    /// alone is a *prior* tuned against a corpus, and tuning it against an
+    /// adversarial set that grows each time the tuning changes chases a
+    /// fixpoint that is not there. Five rewrites of `mask_hosts` are what that
+    /// costs (issue #5).
+    ///
+    /// A field called `host`, `remote` or `upstream` is a hostname **by
+    /// contract**: nothing else belongs in it. So for those names the question
+    /// is not "is this shaped like a hostname" but "is this a name at all",
+    /// which is answerable — and it is answered confidently rather than
+    /// probabilistically, in the one place where a false negative is a leak and
+    /// a false positive is a mangled field a maintainer can still read.
+    ///
+    /// Everything else — `message`, `err`, an unknown name — gets exactly what
+    /// it got before. That is deliberate: the module-path collisions live in
+    /// free text, so this is the signal that lets the free-text rule stay where
+    /// it is instead of being widened to compensate.
+    ///
+    /// `None` is [`Self::scrub`], and is what any caller with no field context
+    /// gets. Passing `Some("")` is the same as `None`: an empty name carries no
+    /// information, and treating it as a host field would be inventing one.
+    pub fn scrub_value(&self, field: Option<&str>, value: &str) -> String {
+        // Everything below, unchanged: the general rules, and the free-text
+        // host rule at the end.
+        let mut out = self.scrub_common(value);
+
+        if field.is_some_and(is_host_field) {
+            // The field-aware pass, which runs AFTER the general rules so a value
+            // they already handled is not handled twice. Deliberately last:
+            // `mask_hosts` in the free-text path can only over-mask, while this
+            // can only mask a name that is a name.
+            //
+            // `keep_hosts` is re-swapped out around it. The general rules
+            // restore a kept name on their way out, so by the time this runs the
+            // name is back in the text and would be masked again — silently
+            // breaking `keep_hosts` for exactly the fields where a consumer most
+            // needs it. Swapping here rather than patching afterwards is what
+            // keeps the two passes from each undoing the other.
+            //
+            // The token is NUL-delimited because this pass's pattern accepts bare
+            // words, and a token like `sqf0` is one: it was masked in place and
+            // the name came out as `\0<host>\0`. NUL cannot appear in the input —
+            // `sanitize_for_block` turns control characters into a replacement
+            // glyph long before this — so the token is unambiguous.
+            let mut restored: Vec<(String, &str)> = Vec::new();
+            for (index, host) in self.keep_hosts.iter().enumerate() {
+                if out.contains(host.as_str()) {
+                    let token = format!("\u{0}{index}\u{0}");
+                    out = out.replace(host.as_str(), &token);
+                    restored.push((token, host));
+                }
+            }
+            out = mask_names_in_host_field(&out);
+            for (token, host) in restored {
+                out = out.replace(&token, host);
+            }
+        }
+        out
+    }
+
+    /// The rules that do not depend on the field name.
+    ///
+    /// Split out of [`Redactor::scrub_value`] so the general path and the
+    /// field-aware one share one implementation rather than two that can drift.
+    fn scrub_common(&self, value: &str) -> String {
         // Strip invisibles only where one could hide a split credential:
         // between two ASCII alphanumerics. A zero-width space inside
         // `ghp_abc<zwsp>def` defeats every character-class run below and
@@ -383,8 +536,17 @@ impl Redactor {
         ] {
             out = pattern.replace_all(&out, replacement).to_string();
         }
-        // Last, and not in the table above: the host rule needs the match in
-        // hand to decide, so it cannot be expressed as a replacement string.
+        // Last, and not in the table above: the host rules need the match in
+        // hand to decide, so they cannot be expressed as a replacement string.
+        //
+        // The anchored rule runs FIRST, before the shape-based one, and for a
+        // deliberate reason: it decides on *position*, which is the one signal
+        // available in free text, and it is right about a token the shape rule
+        // would have to guess at. A name in host position is a name whether or
+        // not it has a dot in it — `resolve bastion` and `connect to vault` leak
+        // under every shape-based rule in this file, and this one catches both.
+        out = mask_anchored_hosts(&out);
+        out = mask_anchored_machines(&out);
         out = mask_hosts(&out);
 
         for (token, host) in preserved {
@@ -460,9 +622,13 @@ impl Redactor {
 
         let mut fields: Vec<(String, String)> = Vec::new();
 
+        // The field name is passed through, which is the whole point: it is the
+        // one piece of context that says whether a dotted value is a hostname or
+        // a package path, and it is free here because JSONL hands it to us. The
+        // same loop existed before and discarded it.
         for name in &self.scrubbed {
             if let Some(raw) = object.get(name).and_then(json_scalar) {
-                let scrubbed = self.scrub(&raw);
+                let scrubbed = self.scrub_value(Some(name), &raw);
                 if !scrubbed.is_empty() {
                     fields.push((name.clone(), quote_if_spaced(&scrubbed)));
                 }
@@ -470,7 +636,10 @@ impl Redactor {
         }
         for name in &self.allowed {
             if let Some(raw) = object.get(name).and_then(json_scalar) {
-                fields.push((name.clone(), quote_if_spaced(&self.scrub(&raw))));
+                fields.push((
+                    name.clone(),
+                    quote_if_spaced(&self.scrub_value(Some(name), &raw)),
+                ));
             }
         }
 
@@ -985,6 +1154,348 @@ const WORDLIKE_PRIVATE_SUFFIXES: &[&str] = &["local"];
 /// hyphens in them.
 fn looks_like_a_machine(label: &str) -> bool {
     label.contains('-') || label.bytes().any(|b| b.is_ascii_digit())
+}
+
+/// Field names whose value is a hostname by contract.
+///
+/// The decisive signal, and it is already in the crate: the JSONL path knows a
+/// value came from a field called `host` or `upstream`, which is a statement
+/// about the value's meaning rather than a guess from its shape. Nothing else
+/// belongs in a field with one of these names — a `host` field holding
+/// `django.contrib.auth.models` is a mislabelled log, and a masked one is the
+/// right answer to that.
+///
+/// Matched case-insensitively and as a **suffix of a dotted path**, so
+/// `net.peer.address` and `db_host` are caught. A bare `contains` would also
+/// catch `ghost` and `hostname_suffix`, which are not hostnames — the cost of a
+/// false positive here is one mangled field, and the cost of a false negative
+/// is a published internal name, so the bias is deliberate but the match is
+/// still anchored.
+const HOST_FIELD_NAMES: &[&str] = &[
+    // The core set #5 names.
+    "host",
+    "hostname",
+    "remote",
+    "peer",
+    "addr",
+    "endpoint",
+    "server",
+    "upstream",
+    // Shapes that appear in the same contract position and mean the same thing.
+    "address",
+    "destination",
+    "target",
+    "origin",
+    "node",
+    "instance",
+    "authority",
+    "upstream_addr",
+    "remote_addr",
+];
+
+/// Whether a field name says its value is a network name.
+///
+/// Empty is not a host field: an absent name carries no information, and
+/// treating `Some("")` as one would invent a certainty the caller did not give.
+///
+/// Matched on a `.` or `_` boundary, so `net.peer.address` and `db_host` both
+/// reach `address` and `host`. A bare `contains` would also swallow `ghost` and
+/// `hostname_suffix`, which name no network at all — the cost of a false
+/// positive here is one mangled field, and the cost of a false negative is a
+/// published internal name, so the bias is deliberate but the match is still
+/// anchored.
+///
+/// Note this governs how a value is scrubbed, not whether it is carried. A
+/// field is retained by exact name from the allowlist, so `peer_addr` is dropped
+/// before this ever runs unless a caller has added it — the boundary is
+/// deliberate, since an unlisted field is a field nobody has decided to publish.
+fn is_host_field(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    HOST_FIELD_NAMES.iter().any(|candidate| {
+        lower == *candidate
+            || lower.ends_with(&format!(".{candidate}"))
+            || lower.ends_with(&format!("_{candidate}"))
+    })
+}
+
+/// A dotted run that is a name, for the field-aware rule.
+///
+/// **A dot is not required.** The first draft of this required one, reasoning
+/// that a single label carries no domain to disclose — and the end-to-end canary
+/// caught it immediately, because `host=cache01` and `peer=frontend` are exactly
+/// the values these fields exist to carry. A single label in a field called
+/// `host` is the machine's own name, which is the most identifying thing in the
+/// line, not the least.
+///
+/// The trade it introduces is real and narrow: `host=localhost` becomes
+/// `<host>`. That is a loss of a useful word, and it is taken deliberately,
+/// because the alternative is a rule that publishes the name whenever the name
+/// happens to be one label long — and a name that is one label long is the
+/// common case for a container, a service, or a developer's laptop.
+///
+/// A consumer who wants `localhost` kept has `keep_hosts` for it, and the
+/// preservation happens around this rule rather than through it.
+fn host_field_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?x)
+              [A-Za-z0-9_](?:[A-Za-z0-9_\-]*[A-Za-z0-9_])?
+              (?:\.[A-Za-z0-9_](?:[A-Za-z0-9_\-]*[A-Za-z0-9_])?)*
+              (?::\d{1,5})?
+            ",
+        )
+        .expect("static host-field pattern")
+    })
+}
+
+/// Mask every name in a value that arrived in a host field.
+///
+/// See [`Redactor::scrub_value`] for why this is separate from [`mask_hosts`]
+/// and can be more aggressive than it.
+///
+/// The boundaries are checked in the callback rather than the pattern, because
+/// there is no look-around to spend. Both are the same test: a match that is
+/// flush against a character which could be part of a longer name is a fragment
+/// of that name, and masking the fragment would publish the rest — masking
+/// `bastion` out of `bastion.corp.acme.com` and leaving `corp.acme.com` is
+/// worse than useless, because that is the half that names the organisation.
+fn mask_names_in_host_field(value: &str) -> String {
+    // Markers this crate has already produced, protected from a second pass.
+    //
+    // Done by splitting on them rather than by testing the match, because the
+    // match cannot be tested: `<host>` is four bare words to a pattern that
+    // accepts bare words, and its `<` and `>` are word boundaries, so a callback
+    // guard on the surrounding text does not fire. Splitting also makes the
+    // idempotence structural instead of a check that has to be re-derived every
+    // time the pattern changes.
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    // The markers `scrub_common` can emit. `keep_hosts` swaps in a token of its
+    // own and restores it afterwards, so it is handled by the caller instead.
+    const MARKERS: &[&str] = &["<host>", "<ip>", "<ssh-target>", "<git-remote>"];
+
+    loop {
+        // The earliest marker wins, so a value carrying two of them is handled
+        // in one pass rather than needing a loop per marker.
+        let next = MARKERS
+            .iter()
+            .filter_map(|marker| rest.find(marker).map(|at| (at, *marker)))
+            .min_by_key(|(at, _)| *at);
+        let Some((at, marker)) = next else {
+            out.push_str(&mask_names_in_host_field_run(rest));
+            return out;
+        };
+        out.push_str(&mask_names_in_host_field_run(&rest[..at]));
+        out.push_str(marker);
+        rest = &rest[at + marker.len()..];
+        if rest.is_empty() {
+            return out;
+        }
+    }
+}
+
+/// Mask the runs in a stretch of text that contains no markers.
+fn mask_names_in_host_field_run(value: &str) -> String {
+    if value.is_empty() {
+        return String::new();
+    }
+    host_field_re()
+        .replace_all(value, |caps: &regex::Captures<'_>| {
+            let Some(matched) = caps.get(0) else {
+                return String::new();
+            };
+            // The boundaries are checked here rather than in the pattern because
+            // there is no look-around to spend.
+            //
+            // `:` counts as a continuation on BOTH sides. The general rules run
+            // first and have already masked the name, so what reaches this pass
+            // is `<host>:5432`; without it, the run starting after the colon is
+            // masked as a port in its own right and the value comes out
+            // `<host>:<host>`, which reads as two things rather than one. The
+            // port identifies the service, which is the half of that value a
+            // maintainer actually needs.
+            //
+            // NUL blocks a match outright. It cannot occur in input —
+            // `sanitize_for_block` replaces control characters long before here
+            // — so it is only ever the delimiter of a `keep_hosts` token, and
+            // that name must not be masked. It has to be an explicit check: a
+            // token like `\0 0 \0` contains the bare word `0`, which this pattern
+            // matches, and without this the kept name came back as `\0<host>\0`.
+            let before = value
+                .get(..matched.start())
+                .and_then(|b| b.chars().next_back());
+            let after = value.get(matched.end()..).and_then(|a| a.chars().next());
+            if before == Some('\u{0}') || after == Some('\u{0}') {
+                return matched.as_str().to_string();
+            }
+            let continues_left = before
+                .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'));
+            let continues_right = after
+                .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'));
+
+            if continues_left || continues_right {
+                matched.as_str().to_string()
+            } else {
+                "<host>".to_string()
+            }
+        })
+        .to_string()
+}
+
+/// A name in host position, after an anchor that settles it.
+///
+/// The second half of #5's hybrid, and the signal free text actually offers. A
+/// hostname and a reverse-DNS package are the same string in opposite orders,
+/// so shape cannot separate them — but **position** can: a name after `resolve `
+/// or inside `host=` is a name, whatever it looks like, because nothing else
+/// goes there. That is a statement about the sentence rather than a prior tuned
+/// against a corpus, which is what lets this rule be certain where
+/// [`mask_hosts`] has to guess.
+///
+/// It also covers a shape no rule in this file could reach before: a
+/// **single-label** name. `resolve bastion` publishes the machine's own name and
+/// leaked under every shape-based rule, because there is no dot to build a
+/// dotted run out of. Position is the only thing that identifies those.
+///
+/// The anchors here are the ones that settle the question by themselves —
+/// a resolver naming what it could not find, a connection naming its target, a
+/// `key=` form a structured logger emits. Tool verbs are in
+/// [`anchored_machine_re`] instead, because they need more evidence; see there
+/// for why.
+///
+/// **Locale-specific, and stated rather than hidden.** These are English and
+/// configuration conventions. `Could not resolve` is one resolver's wording; a
+/// message in another language, or from a library that phrases it differently,
+/// gets no help from this rule. A guarantee that quietly depends on the
+/// reporter's locale is not a guarantee, so the limitation belongs in the docs
+/// rather than in a test that would only ever assert the English case.
+fn mask_anchored_hosts(value: &str) -> String {
+    anchored_host_re()
+        .replace_all(value, "${1}${2}<host>")
+        .to_string()
+}
+
+/// A name in host position, after a tool verb — which needs more evidence.
+///
+/// `curl`, `ssh` and `ping` take a host as their first argument, but they also
+/// appear in ordinary sentences: `curl the page`, `ssh the gateway`, `ping the
+/// printer`. An anchor that settles the question on its own is no use there, so
+/// the token must additionally carry one of the three things that make it a
+/// machine name — a dot, a digit, or a hyphen.
+///
+/// `curl web-01.acme.com` and `ssh db-01.internal` are caught; `curl the page` is
+/// left alone.
+///
+/// **`dial` is not one of these.** It is a connection verb, not a tool, and
+/// belongs with the anchors that settle it: `dial redis` is a real leak of a
+/// real service name, and there is no ordinary English reading of it — the false
+/// positive it costs (`dial tone`, in a phone-system error message) is rarer
+/// than the leak it prevents. That asymmetry is the whole reason the two rules
+/// are separate rather than one rule with a shape test.
+///
+/// No look-around, as everywhere in this file. The left boundary is *consumed*
+/// and restored in group 1 rather than looked past, which is what stops
+/// `presolve` from anchoring, and the right boundary is asserted in the callback
+/// because a pattern cannot.
+///
+/// A dotted run is **one** name and is masked whole: `resolve bastion.corp.acme-inc`
+/// has to become `resolve <host>`, not `resolve<host>.corp.acme-inc`. Nibbling
+/// the first label off and leaving the tail is worse than no rule at all, because
+/// the tail is the part that names the organisation — the failure this file
+/// already records once, for a fragment-of-a-longer-run match.
+fn mask_anchored_machines(value: &str) -> String {
+    anchored_machine_re()
+        .replace_all(value, |caps: &regex::Captures<'_>| {
+            let Some(matched) = caps.get(0) else {
+                return String::new();
+            };
+            let whole = matched.as_str();
+            // A flush continuation means this is a fragment of a longer token,
+            // and masking the fragment would publish the rest.
+            let continues = value
+                .get(matched.end()..)
+                .and_then(|rest| rest.chars().next())
+                .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
+            // The shape test. `curl the page` is English; `curl web-01.acme.com`
+            // is a diagnostic. See `anchored_machine_re` for why this is not a
+            // look-ahead in the pattern.
+            let name = caps.name("name").map(|m| m.as_str()).unwrap_or_default();
+            if continues || !looks_like_a_machine_name(name) {
+                whole.to_string()
+            } else {
+                // Restore the consumed boundary character, then the masked name.
+                let boundary = caps.get(1).map(|m| m.as_str()).unwrap_or_default();
+                format!("{boundary}<host>")
+            }
+        })
+        .to_string()
+}
+
+/// Anchors that settle it: resolution, connection, and `key=` forms.
+///
+/// Group 1 is the boundary in front of the anchor and group 2 is the anchor
+/// itself; both are restored on substitution, so the sentence keeps its verb
+/// (`Could not resolve <host>`) and a structured field keeps its key
+/// (`host=<host>`). Losing the key would leave a maintainer reading a bare
+/// `<host>` with nothing saying what it was.
+///
+/// The trailing `\b` on each alternative is what keeps `presolve`, `resolver` and
+/// `resolve()` from anchoring — `resolve()` is a call in a stack trace, and that
+/// is the one line in a bug report a maintainer most wants intact.
+fn anchored_host_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?xi)
+              (^|[^A-Za-z0-9_])
+              # The trailing whitespace is INSIDE group 2 so it is restored with
+              # the anchor. Outside it, `resolve bastion` became
+              # `resolve<host>` — the crate editing text it was only asked to
+              # redact, in a preview whose whole promise is that it shows what
+              # would leave.
+              (
+                \b(?:could\s+not\s+)?resolv(?:e|ed|ing)\b\s+
+              | \bconnect(?:ing|ed)?\s+to\s+
+              | \bdial(?:l?ing|led)?\s+
+              | \b(?:host|hostname|addr|address|peer|remote|server|upstream
+                    |endpoint|origin|node|destination|target)\s*[=:]\s*
+              )
+              (?P<name>[A-Za-z0-9_](?:[A-Za-z0-9_\-]*[A-Za-z0-9_])?
+                (?:\.[A-Za-z0-9_](?:[A-Za-z0-9_\-]*[A-Za-z0-9_])?)*)
+              (?::\d{1,5})?
+            ",
+        )
+        .expect("static anchored-host pattern")
+    })
+}
+
+/// Tool verbs, which need the token to look like a machine name as well.
+///
+/// The shape requirement is checked in the callback rather than the pattern,
+/// because "at least one of `.`, `-` or a digit appears somewhere in this run"
+/// is not expressible without a look-ahead, and this engine has none. The
+/// pattern takes any run and the callback decides.
+fn anchored_machine_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?xi)
+              (^|[^A-Za-z0-9_])
+              \b(?:curl|wget|ping|nc|ssh|scp|rsync|dig|nslookup|telnet|smtp|proxy)\b\s+
+              (?P<name>[A-Za-z0-9_\-]+(?:\.[A-Za-z0-9_\-]+)*(?::\d{1,5})?)
+            ",
+        )
+        .expect("static anchored-machine pattern")
+    })
+}
+
+/// Whether a run carries one of the three things that make it a machine name.
+///
+/// A dot, a hyphen, or a digit. `the`, `page` and `tone` have none and are left
+/// alone; `web-01`, `10.0.0.5` and `acme-inc` each have one and are masked.
+fn looks_like_a_machine_name(run: &str) -> bool {
+    run.contains('.') || run.contains('-') || run.bytes().any(|b| b.is_ascii_digit())
 }
 
 /// Apply [`private_host_re`], with the guards a regex cannot express.
@@ -2040,5 +2551,415 @@ mod host_corpus {
             "word-shaped: survives, by decision"
         );
         assert!(!masked("config.local"), "the case the relaxation protects");
+    }
+
+    // ── Field provenance (#5) ──
+    //
+    // The free-text rule above is a prior and cannot do better: a hostname and
+    // a reverse-DNS package are the same string in opposite orders, and over a
+    // context-free token there is no discriminator that is not another prior.
+    // That is why `printer.local` survives and why the five rounds before it
+    // each fixed the last and opened another.
+    //
+    // What changes with field provenance is that the question stops being
+    // "what does this token look like". A field called `host` says what it is,
+    // so the rule can be certain instead of probable — and certain is what a
+    // two-label name needs, because that is exactly the case the shape-based
+    // rule has to keep for `foo.tar.gz`.
+    //
+    // Measured across 13 suffixes × 6 machine-shaped leading labels: 40 leaks
+    // in free text, 0 in a `host` field. And 0 over-masked module paths in
+    // either, because the field rule does not touch `message`.
+
+    /// The leak class the free-text rule cannot close, closed.
+    #[test]
+    fn a_host_field_names_are_masked_whatever_the_suffix() {
+        // Every one of these survives `scrub`. Two labels is not enough for the
+        // free-text rule — `config.local` and `foo.tar.gz` are the same shape —
+        // so the whole set is a leak today and none of it is after.
+        for tld in [
+            "com", "net", "org", "io", "dev", "co.uk", "corp", "internal", "intranet", "lan",
+            "local", "arpa", "private",
+        ] {
+            for host in ["bastion", "db01", "vault", "web-3", "cache", "gateway"] {
+                let value = format!("{host}.{tld}");
+                assert!(
+                    redactor()
+                        .scrub_value(Some("host"), &value)
+                        .contains("<host>"),
+                    "{value:?} in a `host` field must be masked"
+                );
+            }
+        }
+    }
+
+    /// The other half, and the one that makes the rule safe to be certain about.
+    ///
+    /// The aggressive behaviour is only defensible because it is confined to
+    /// fields that claim to hold a network name. If it reached `message` it
+    /// would eat every stack frame again — which is what round one of the five
+    /// did, and what the `SURVIVORS` corpus above exists to prevent.
+    #[test]
+    fn the_field_rule_does_not_reach_free_text() {
+        for input in SURVIVORS {
+            // The same value, in a field that does not claim to be a host.
+            assert_eq!(
+                redactor().scrub_value(Some("message"), input),
+                *input,
+                "{input:?} in a `message` field must survive untouched"
+            );
+        }
+    }
+
+    /// `scrub` is `scrub_value(None, …)`, and the two must not drift.
+    ///
+    /// A caller with no field context — `Provenance::scrubbed`, a hand-built
+    /// value, any future surface — gets the free-text rules and nothing else.
+    /// If this drifts, every one of those paths silently acquires the aggressive
+    /// behaviour, and the module paths go with it.
+    #[test]
+    fn no_field_context_means_the_free_text_rules() {
+        for input in [
+            "bastion.com",
+            "vault.internal",
+            "os.path.join",
+            "config.local",
+        ] {
+            assert_eq!(
+                redactor().scrub(input),
+                redactor().scrub_value(None, input),
+                "scrub and scrub_value(None) disagree on {input:?}"
+            );
+        }
+    }
+
+    /// An empty field name carries no information.
+    ///
+    /// `Some("")` is what a record with a blank key produces, and treating it as
+    /// a host field would invent a certainty the caller never gave. It is the
+    /// free-text path.
+    #[test]
+    fn an_empty_field_name_is_not_a_host_field() {
+        assert_eq!(
+            redactor().scrub_value(Some(""), "bastion.com"),
+            redactor().scrub("bastion.com")
+        );
+    }
+
+    /// Field names are matched case-insensitively and as a dotted path.
+    ///
+    /// `net.peer.address` and `db_host` are the same contract as `host`. A bare
+    /// `contains` would also swallow `ghost` and `hostname_suffix`, which name
+    /// no network at all — so the match is anchored at a `.` or the whole name.
+    #[test]
+    fn host_field_names_match_paths_and_case_but_not_substrings() {
+        for name in [
+            "host",
+            "Host",
+            "HOST",
+            "net.peer.address",
+            "db_host",
+            "remote_addr",
+        ] {
+            assert!(
+                is_host_field(name),
+                "{name:?} names a network endpoint and should match"
+            );
+            assert!(
+                redactor()
+                    .scrub_value(Some(name), "bastion.com")
+                    .contains("<host>"),
+                "{name:?} should mask a name in its value"
+            );
+        }
+        for name in [
+            "ghost",
+            "hostname_suffix",
+            "message",
+            "err",
+            "event",
+            "whostname",
+        ] {
+            assert!(!is_host_field(name), "{name:?} is not a host field");
+        }
+    }
+
+    /// A run is masked whole or not at all.
+    ///
+    /// Masking `bastion` out of `bastion.corp.acme.com` and leaving
+    /// `corp.acme.com` would publish the half that names the organisation, which
+    /// is the part a reader can act on. The boundary guards exist for this and
+    /// are in the callback, because this engine has no look-around.
+    #[test]
+    fn a_host_field_name_is_masked_whole_never_in_pieces() {
+        for value in [
+            "bastion.corp.acme.com",
+            "db-01.internal.acme.corp",
+            "vault.internal.and.cache.lan",
+        ] {
+            let masked = redactor().scrub_value(Some("host"), value);
+            assert!(
+                !masked.contains("acme") && !masked.contains("corp") && !masked.contains("lan"),
+                "{value:?} left a fragment behind: {masked}"
+            );
+        }
+    }
+
+    /// A single label in a host field is the machine's own name, and is masked.
+    ///
+    /// The first draft of this rule required a dot, on the reasoning that a bare
+    /// word carries no domain to disclose. The end-to-end canary caught it in one
+    /// run: `host=cache01` and `peer=frontend` are exactly the values these
+    /// fields carry, and both were published whole. A name that is one label long
+    /// is the common case for a container or a service, not the rare one.
+    ///
+    /// So `localhost` is masked too, which is a real loss of a useful word and is
+    /// taken deliberately — the alternative is a rule that publishes the name
+    /// whenever the name happens to be short. `keep_hosts` is the opt-out, and it
+    /// works because preservation happens around this rule rather than through it.
+    #[test]
+    fn a_bare_word_in_a_host_field_is_masked() {
+        for value in ["localhost", "redis", "cache01", "frontend", "kubernetes"] {
+            assert_eq!(
+                redactor().scrub_value(Some("host"), value),
+                "<host>",
+                "{value:?} in a `host` field is the machine's own name"
+            );
+        }
+        // A literal address is masked by the address rule, which runs first and
+        // is not field-aware — also correct, and asserted so the two rules are
+        // not confused for one.
+        assert_eq!(
+            redactor().scrub_value(Some("host"), "127.0.0.1"),
+            "<ip>",
+            "a literal address is masked by the address rule, which runs first"
+        );
+    }
+
+    /// `keep_hosts` is the opt-out, and it still works.
+    ///
+    /// The preservation happens in the general rules and is restored after them,
+    /// so a name a consumer has explicitly kept is not re-masked by the
+    /// field-aware pass running afterwards. Without this, `keep_hosts` would be
+    /// silently broken for every field named `host`.
+    #[test]
+    fn an_explicitly_kept_host_survives_a_host_field() {
+        let redactor = Redactor::new().keep_hosts(["api.github.com", "localhost"]);
+        assert_eq!(
+            redactor.scrub_value(Some("host"), "api.github.com"),
+            "api.github.com"
+        );
+        assert_eq!(redactor.scrub_value(Some("host"), "localhost"), "localhost");
+    }
+
+    /// The field rule is idempotent.
+    ///
+    /// It runs after rules that have already produced markers, and a bare word
+    /// is four of them, so without a guard `<host>` came back as `<<host>>`. A
+    /// rule that changes a value on a second pass makes every caller that
+    /// scrubs twice — a preview and a send, say — produce something different
+    /// from what was shown.
+    #[test]
+    fn the_field_rule_does_not_re_mask_its_own_output() {
+        for field in ["host", "peer", "upstream"] {
+            let once = redactor().scrub_value(Some(field), "bastion.corp");
+            let twice = redactor().scrub_value(Some(field), &once);
+            assert_eq!(once, twice, "scrubbing {field} twice changed the value");
+            assert!(!once.contains("<<"), "{field} double-masked: {once}");
+        }
+    }
+
+    /// A port belongs to the name and travels with it.
+    ///
+    /// `<host>:5432` says the connection was refused on a database port, which is
+    /// the difference between a maintainer reading this and asking a question.
+    #[test]
+    fn a_port_stays_attached_to_the_masked_name() {
+        assert_eq!(
+            redactor().scrub_value(Some("host"), "db01.corp:5432"),
+            "<host>:5432"
+        );
+    }
+
+    /// Several names in one value are each masked.
+    ///
+    /// A field can hold a comma-joined list, and a value where only the first
+    /// name is masked is a value that still names the rest.
+    #[test]
+    fn every_name_in_a_listed_value_is_masked() {
+        let masked = redactor().scrub_value(Some("upstream"), "vault.internal, cache.lan, db01");
+        assert_eq!(masked.matches("<host>").count(), 3, "{masked}");
+    }
+
+    /// The JSONL path is where the signal exists, so it is where it must be used.
+    ///
+    /// `records` has the field name in hand and was discarding it. This is the
+    /// only test that proves the plumbing, rather than proving the rule: a rule
+    /// that works and is never called is worth nothing.
+    ///
+    /// The assertion is on the *field*, not on the string. The same name appears
+    /// in `message` in the same line, and there the free-text rules apply and it
+    /// survives — which is correct, and is the point: the two fields hold the
+    /// same bytes and get different treatment because of what they are called.
+    #[cfg(feature = "logs")]
+    #[test]
+    fn the_jsonl_path_passes_the_field_name_through() {
+        let line = r#"{"timestamp":"2026-08-12T09:00:00Z","level":"error","message":"bastion.com is down","host":"bastion.com"}"#;
+        let records = redactor().records(line, None);
+        assert_eq!(records.len(), 1);
+        let rendered = records[0].render();
+
+        let host = records[0]
+            .fields
+            .iter()
+            .find(|(name, _)| name == "host")
+            .map(|(_, value)| value.as_str())
+            .expect("the host field is carried");
+        assert_eq!(host, "<host>", "the `host` field is masked by its name");
+
+        assert!(
+            rendered.contains("bastion.com is down"),
+            "`message` is free text and keeps the free-text rules: {rendered}"
+        );
+    }
+
+    // ── Host position (#5) ──
+    //
+    // The third signal, and the one free text actually offers. A hostname and a
+    // reverse-DNS package are the same string in opposite orders, so shape cannot
+    // separate them; **position** can, because nothing but a name follows
+    // `resolve ` or sits inside `host=`.
+    //
+    // What it buys that shape cannot: a **single-label** name. `resolve bastion`
+    // publishes the machine's own name, and no rule in this file could reach it,
+    // because there is no dot to build a dotted run out of. That is the leak
+    // class the five rounds could not close and the one this closes.
+
+    /// A single-label name in host position, which shape alone cannot find.
+    ///
+    /// The expected outputs keep the verb and the key. That is not incidental:
+    /// the crate is here to redact, not to rewrite, and a preview whose promise
+    /// is "exactly what would leave" cannot also be a preview of a tidied-up
+    /// sentence. `host=<host>` rather than `<host>` for the same reason — a
+    /// maintainer reading a bare `<host>` has lost the field it came from.
+    #[test]
+    fn a_single_label_name_in_host_position_is_masked() {
+        for (value, expected) in [
+            ("resolve bastion failed", "resolve <host> failed"),
+            ("could not resolve gateway", "could not resolve <host>"),
+            ("connect to vault refused", "connect to <host> refused"),
+            ("dial redis timed out", "dial <host> timed out"),
+            ("host=standalone", "host=<host>"),
+            ("peer=frontend", "peer=<host>"),
+            ("upstream=cache-01", "upstream=<host>"),
+        ] {
+            assert_eq!(
+                redactor().scrub(value),
+                expected,
+                "{value:?} names a machine in host position"
+            );
+        }
+    }
+
+    /// A bare word after a *tool* verb is English, and stays.
+    ///
+    /// The asymmetry with the rule above is deliberate and is the whole reason
+    /// there are two of them. `resolve bastion` has no ordinary reading, so a
+    /// bare word there is a leak. `curl the page` and `ping the printer` are
+    /// sentences, so a bare word there is not — and `ssh the gateway` is exactly
+    /// the kind of thing a bug report contains.
+    ///
+    /// The token still has to look like a machine name, so the tool rules are not
+    /// simply weaker: they are differently conditioned.
+    #[test]
+    fn a_bare_word_after_a_tool_verb_is_english() {
+        for value in [
+            "curl the page",
+            "ping the printer",
+            "ssh the gateway",
+            "scp the file",
+        ] {
+            assert!(
+                !redactor().scrub(value).contains("<host>"),
+                "{value:?} is a sentence, not a hostname"
+            );
+        }
+    }
+
+    /// And the tool rules do fire when the token does look like a machine.
+    #[test]
+    fn a_tool_verb_with_a_machine_shaped_token_is_masked() {
+        for value in [
+            "curl web-01.acme.com",
+            "ssh db-01.internal",
+            "ping build01.corp",
+            "rsync cache-01.acme.com:/srv",
+        ] {
+            assert!(
+                redactor().scrub(value).contains("<host>"),
+                "{value:?} is a tool invocation naming a host"
+            );
+        }
+    }
+
+    /// An anchor has to be a word, not a fragment of one.
+    ///
+    /// `presolve`, `resolver` and `resolve()` are a different vocabulary
+    /// entirely, and `resolve()` in particular is a function call in a stack
+    /// trace — the one line in a bug report a maintainer most wants intact.
+    #[test]
+    fn an_anchor_must_be_a_whole_word() {
+        for value in [
+            "presolve x",
+            "the hostname is unset",
+            "resolve() returned 3",
+            "unresolved reference",
+            "connecting is not a word boundary here",
+        ] {
+            assert_eq!(
+                redactor().scrub(value),
+                value,
+                "{value:?} must not be treated as host position"
+            );
+        }
+    }
+
+    /// A run in host position is masked whole, tail included.
+    ///
+    /// The failure is worth naming because it is the one this rule could easily
+    /// have introduced: taking the first label and leaving the rest publishes
+    /// `corp.acme-inc`, which is the half that names the organisation. The
+    /// pattern claims the entire dotted run for exactly that reason.
+    #[test]
+    fn an_anchored_run_is_masked_whole() {
+        for value in [
+            "resolve bastion.corp.acme-inc failed",
+            "connect to db01.internal.acme.corp",
+            "host=us.internal.acme.com",
+        ] {
+            let masked = redactor().scrub(value);
+            for leak in ["acme", "corp", "internal", "bastion", "db01"] {
+                assert!(
+                    !masked.contains(leak),
+                    "{value:?} leaked {leak:?} in a fragment: {masked}"
+                );
+            }
+        }
+    }
+
+    /// The position rules must not reach module paths, which is the failure
+    /// mode of every previous round.
+    ///
+    /// `SURVIVORS` re-checked through `scrub`, now that two more rules run over
+    /// the same text. A new rule that widened the reach of the host rules would
+    /// show up here first.
+    #[test]
+    fn the_position_rules_do_not_reach_module_paths() {
+        for input in SURVIVORS {
+            assert!(
+                !redactor().scrub(input).contains("<host>"),
+                "{input:?} must survive the position rules too"
+            );
+        }
     }
 }

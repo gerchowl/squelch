@@ -61,8 +61,17 @@ account's home, an email, a private IPv4, a compressed IPv6, an internal FQDN, a
 private org, a labelled secret, an AWS session key, a Stripe key, a bearer
 token, a zero-width-split credential, private-key armour, a forge URL with no
 `.git`, Google/Slack/Telegram tokens, a driveless Windows path, a UNC share, a
-MAC address — planted in log fields *and* in provenance, then asserted absent
-from every payload.
+MAC address, and three **single-label** machine names — planted in log fields
+*and* in provenance, then asserted absent from every payload.
+
+The single-label canaries are the ones that caught a bug. The field-name rule
+originally required a dotted run, on the reasoning that a bare word discloses no
+domain; `host=cache01` and `peer=frontend` walked straight through it and were
+published whole. A unit test would have needed to be written to notice, because
+nothing about the rule's *shape* suggested the case — but an end-to-end
+assertion that a planted name never arrives needs no such hint. This is the
+argument for the receiver-shaped tests generally: they assert on the payload
+rather than on the rule that produced it.
 
 Two properties keep it from going vacuous:
 
@@ -190,19 +199,52 @@ A hostname and a reverse-DNS identifier are the same string in opposite orders.
 Over a context-free dotted token there is no discriminator that is not a prior,
 so every version of the rule must have both false positives and false
 negatives, and the only question is which corpus the prior is tuned against.
-Tuning it against an adversarial test set that grows every time the tuning
+Tuning it against an adversarial test set that grows each time the tuning
 changes is chasing a fixpoint that is not there.
-
-The rule as it stands is kept — it fixes five rounds of real leaks and real
-over-masking, and is strictly better than what preceded it — but it is now
-documented as a prior rather than a classifier, its two residual leaks are
-named at the module, and the replacement is #5 rather than a sixth patch here.
 
 The lesson worth carrying: **a run of fixes that each look obviously correct is
 itself evidence.** The question to ask after the third one is not "what did I
 miss" but "can this shape be right at all", and the thing to build before the
 answer is "no" is a differential test against real corpora — which would have
 surfaced the whole pattern on its first run.
+
+### The two signals that were sitting there unused
+
+The replacement (#5) is not a better shape rule, because there isn't one. It is
+two signals the crate already had and was discarding:
+
+- **The field name.** `records` looked a value up by name and then threw the
+  name away. A field called `host` holds a hostname *by contract*, which is a
+  statement about meaning rather than a guess from shape, so the rule can be
+  certain where `mask_hosts` has to be probable.
+- **Position in the sentence.** Nothing but a name follows `resolve ` or sits
+  inside `host=`. That reaches the case shape structurally cannot: a
+  **single-label** name, `resolve bastion`, which has no dot to build a dotted
+  run out of and leaked under all five rounds.
+
+Measured over 13 suffixes × 6 machine-shaped leading labels: **40 leaks in free
+text, 0 in a `host` field**, with 0 module paths over-masked in either — the
+field rule does not touch `message`, which is where the collisions live.
+
+Two things that measurement cost, both of which the first draft got wrong:
+
+- **A single label in a host field is masked.** The rule originally required a
+  dot, reasoning that a bare word carries no domain. The end-to-end canary
+  caught it in one run: `host=cache01` and `peer=frontend` are exactly what
+  these fields carry. A name one label long is the common case for a container,
+  not the rare one — and `localhost` goes with it, which `keep_hosts` is the
+  opt-out for.
+- **The rule has to be idempotent.** Accepting bare words means the pattern also
+  matches the crate's own `<host>` marker, and the result was `<<host>>`. Fixed
+  by splitting the value on markers rather than by testing the match, because
+  `<host>` is four bare words to this pattern and its angle brackets are word
+  boundaries, so no callback guard on the surrounding text fires.
+
+`mask_hosts` is kept, and is now the *last* of three rules rather than the only
+one. Its two residual leaks are still named at the module, and the region they
+can occur in is now the smallest it can be: free text, with no field name and
+no position signal.
+
 
 ## No git-hook layer, deliberately
 

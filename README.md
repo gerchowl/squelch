@@ -58,14 +58,37 @@ The scrubber is an **allowlist over structured fields** — named fields are kep
   Four labels, not three, and lowercase-only, because the alternative destroys
   the block: three labels ate `config.yml.bak` and `os.path.join`, and
   case-insensitivity ate `java.lang.Thread.run`. A three-label public host like
-  `foo.example.com` therefore survives — deliberately. Anything genuinely
-  internal is caught by its suffix regardless of depth.
+  `foo.example.com` therefore survives in free text — deliberately.
 
 Invisible characters are stripped **before** any rule runs. A zero-width space
 inside a credential breaks every character-class run, and renders as nothing —
 so a reviewer sees an intact token in the preview and no reason to object.
 
 An allowlist rather than a denylist because a denylist fails open the moment someone adds a log field, and nobody revisits a denylist when they add one. With an allowlist the worst case is a report that's less useful than it could be.
+
+### Hostnames, and why the shape of a string is not enough
+
+A hostname and a reverse-DNS package are **the same string in opposite orders** — `bastion.corp.acme.com` against `com.example.app`. Over a bare dotted token there is no discriminator that isn't itself a guess: case is a convention Java breaks with `com.foo.internal.Impl` and DNS breaks with `SERVER01.CORP`, and `.app` is both a gTLD and the most common module-path ending there is.
+
+So this used to be one shape-based rule, and it was rewritten **five times**, each round correct about the case that motivated it and wrong about the case next door. Five rewrites is not a tuning problem, it is the shape of the problem.
+
+There are now three signals, and only the third is a guess:
+
+| signal | catches | certainty |
+|---|---|---|
+| the **field name** | `host`, `remote`, `upstream`, `peer`, … | certain — a value in a field called `host` is a hostname by contract |
+| **position** in the sentence | after `resolve `, `connect to `, inside `host=` | certain — nothing else goes there |
+| **shape** | anywhere else | a prior, tuned against a corpus |
+
+The first two are what finally reach what shape structurally cannot:
+
+```text
+resolve bastion          →  resolve <host>
+```
+
+A **single-label** name. There is no dot to build a dotted run out of, so no amount of shape analysis finds it — and it is the machine's own name, the most identifying thing in the line. It leaked under every previous version.
+
+The cost, stated rather than discovered: `printer.local` still survives in free text (it is `config.local`'s twin), a bare public FQDN with no verb in front of it survives, and the position anchors are English — a message in another language gets no help from them. All three limits are documented at the rule, and the field-name signal is locale-independent, which is why it is the one to prefer where an application can supply it.
 
 ### The other end of the same concern
 
@@ -183,7 +206,7 @@ Three of those are here because something got through without them:
 
 Early. The redaction rules have been exercised against a real ~10k-line production log corpus and three adversarial review passes, but the API may still shift before 1.0. If you find a leak, that's the bug worth reporting.
 
-Two gaps in the scrubber are decisions rather than oversights, and are written down at the rules themselves: **encoded secrets** (a base64 or `\u`-escaped token matches nothing — the labelled-secret rule catches the JSON error bodies that carry them in practice) and **hosts on suffixes outside the list** the FQDN rule tests against, which exists because without it the rule cannot tell `bastion.corp.acme.com` from `django.contrib.auth.models`.
+Four gaps in the scrubber are decisions rather than oversights, and are written down at the rules themselves: **encoded secrets** (a base64 or `\u`-escaped token matches nothing — the labelled-secret rule catches the JSON error bodies that carry them in practice), **hosts on suffixes outside the list** the FQDN rule tests against, **a bare `<word>.local` in free text**, and **a non-English message**, where the position anchors do not apply. The first is a cost that buys a bounded search; the other three are the residue of a problem that cannot be solved from string shape alone, and the section above says why.
 
 ## License
 

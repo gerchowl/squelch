@@ -79,6 +79,18 @@ pub const CANARIES: &[(&str, &str)] = &[
     ("corporate root with no public tld", "acme-inc"),
     ("shouted tld", "shoutyhost"),
     ("country-code first label", "ccfirsthost"),
+    // The two leak classes the field-name and position rules exist for (#5).
+    //
+    // Both are single-label or two-label names, which is precisely why the
+    // shape-based rule could not reach them: there is no dotted run to analyse.
+    // The first is in a field that names a host, the second in a message after a
+    // resolver verb. Before these rules both were published whole.
+    ("single-label host in a host field", "canarymachinename"),
+    (
+        "single-label host after a resolver verb",
+        "canaryresolvername",
+    ),
+    ("host in a peer field", "canarypeername"),
 ];
 
 /// Text that must SURVIVE. Over-masking makes the block worthless just as
@@ -99,12 +111,19 @@ pub const SURVIVORS: &[&str] = &[
     "com.acme.internal.util",
     "io.netty.internal.buffer",
     "com.acme.internal-tools.util.Client",
+    // The new position rules run over the same text as the shape rule, and they
+    // are the aggressive ones. These are the lines they must leave alone —
+    // `curl the page` and `ssh the gateway` are sentences, not hostnames, and
+    // `resolve()` is a call in a stack trace.
+    "curl the rendered template",
+    "resolve() returned 3 distinct values",
 ];
 
 /// A JSONL log corpus with a canary in every position that matters:
 /// in scrubbed fields (`message`, `err`), where the value rules must catch it;
-/// and in unlisted fields (`args`, `remote`), where the allowlist must drop
-/// the field unread.
+/// in the host-name fields (`host`, `peer`), where the field name itself is the
+/// signal; and in unlisted fields (`args`), where the allowlist must drop the
+/// field unread.
 pub fn canary_logs() -> String {
     [
         r#"{"timestamp":"2026-08-12T09:00:00Z","level":"info","message":"starting","event":"boot","version":"1.4.0"}"#,
@@ -143,6 +162,16 @@ pub fn canary_logs() -> String {
         r#"{"timestamp":"2026-08-12T09:00:19Z","level":"error","event":"tg","message":"bot 123456789:AAG1234567890abcdefghijklmnopqrstuv unauthorized"}"#,
         r#"{"timestamp":"2026-08-12T09:00:20Z","level":"error","event":"fs","message":"cannot open Users\\bobtestuser\\Documents\\notes.txt or \\\\fileserver\\share\\q.docx"}"#,
         r#"{"timestamp":"2026-08-12T09:00:21Z","level":"error","event":"net","message":"iface aa-bb-cc-dd-ee-ff down"}"#,
+        // The two leak classes the field-name and position rules exist for (#5).
+        // Both are single-label names, which no shape-based rule can reach: there
+        // is no dotted run to analyse, and it is the machine's own name.
+        r#"{"timestamp":"2026-08-12T09:00:22Z","level":"error","event":"net","message":"replica fell behind","host":"canarymachinename"}"#,
+        r#"{"timestamp":"2026-08-12T09:00:23Z","level":"error","event":"dns","message":"could not resolve canaryresolvername: Name or service not known"}"#,
+        r#"{"timestamp":"2026-08-12T09:00:24Z","level":"error","event":"net","message":"handshake failed","peer":"canarypeername"}"#,
+        // …and the sentences the aggressive position rules must leave alone.
+        // `curl`/`ssh` take a host as their first argument and also appear in
+        // ordinary prose; `resolve()` is a call in a stack trace.
+        r#"{"timestamp":"2026-08-12T09:00:25Z","level":"error","event":"render","message":"curl the rendered template, then ssh the gateway, and note resolve() returned 3 distinct values"}"#,
         // The survivors. A block scrubbed into uselessness costs the
         // maintainer the same round trip as no block at all, so the corpus
         // pins both ends of the rule.
