@@ -14,7 +14,7 @@ let report = report!()?
     .diagnostics(redactor.records(&logs, Some("myapp.jsonl")))
     .via(Transport::Browser);
 
-println!("{}", report.preview()?);   // exactly what would leave
+println!("{}", report.preview()?);   // exactly what would leave (on open for Browser)
 report.send()?;                       // opens GitHub's form, prefilled
 ```
 
@@ -108,7 +108,7 @@ This is a real bug in the wild, not a hypothetical — `bugreport` formats arbit
 
 | route | validates your form | human reviews first | needs a credential |
 |---|---|---|---|
-| `Browser` *(default)* | yes — GitHub's own | yes — the form **is** the review | no |
+| `Browser` *(default)* | yes — GitHub's own | yes — the form is the review *before submit*; **no** — the URL is disclosed to github.com on open (see `src/url.rs`) | no |
 | `Mailto` | no | yes — their mail client | no |
 | `File` | no | yes — they open it | no |
 | `GhCli` | no | only if you confirm | the user's `gh` |

@@ -142,6 +142,8 @@ fn form() -> squelch::Form {
         .required(),
     ])
     .template("bug.yml")
+    .labels(["bug"])
+    .title_prefix("[bug] ")
 }
 
 fn run() -> Result<String, Box<dyn std::error::Error>> {
@@ -239,8 +241,14 @@ fn run() -> Result<String, Box<dyn std::error::Error>> {
         Route::Schema | Route::Compose { .. } => unreachable!("handled before collection"),
     };
 
+    // `.form(&form())` rather than restating the template: the form is the one
+    // definition of what this application reports against, and it carries the
+    // `labels:` and the title prefix as well. Restating only the template left
+    // both unset on every route that creates the issue itself, so an issue
+    // filed with `gh` arrived unlabelled (#7) — the drift docs/testing.md
+    // warns about, in the one place this file claims not to have it.
     let mut report = Report::to(destination)
-        .template("bug.yml")
+        .form(&form())
         .title("demo report")
         .field("current-behavior", &cli.current)
         .field("reproduction", &cli.repro)

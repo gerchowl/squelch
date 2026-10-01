@@ -100,9 +100,9 @@ The first version of this suite was reviewed by an agent that instrumented it
 and counted branch hits. The result was worth more than any finding: over 447
 generated cases, the assertion the whole property exists for — *a field vanished
 from the URL and nothing named it* — **ran zero times**. Arbitrary builder
-operations almost never produce values that compete for a 7 500-character
-budget, so the branch was unreachable in practice while the test reported
-success.
+operations almost never produce values that compete for a
+4 200-character budget, so the branch was unreachable in practice while
+the test reported success.
 
 That is worse than having no test, because it is counted as coverage.
 
@@ -129,7 +129,7 @@ Three rules keep it honest:
   genuinely is not idempotent — two independent sources of the same warning must
   both survive. Encoding which operations are adopt-style is the point; if the
   property had been weakened instead, it would have stopped asserting anything.
-- **Generators are biased toward the 7 500-character URL budget** rather than
+- **Generators are biased toward the 4 200-character URL budget** rather than
   sampled uniformly, or the boundary where truncation and dropping happen is
   essentially never reached.
 

@@ -26,6 +26,12 @@ pub struct Report {
     required: Vec<String>,
     provenance: Option<Provenance>,
     provenance_field: String,
+    /// Labels to apply to the issue, from the form definition (e.g. `["bug"]`).
+    /// Not the field labels above — these become `--label` on the `gh` CLI.
+    issue_labels: Vec<String>,
+    /// Title prefix from the form (e.g. `[bug] `), for the `gh` route to
+    /// prepend to the title.
+    title_prefix: Option<String>,
     diagnostics: Vec<Record>,
     transport: Transport,
     confirmed: bool,
@@ -46,6 +52,8 @@ impl Report {
             required: Vec::new(),
             provenance: None,
             provenance_field: "environment".into(),
+            issue_labels: Vec::new(),
+            title_prefix: None,
             diagnostics: Vec::new(),
             transport: Transport::default(),
             confirmed: false,
@@ -83,6 +91,12 @@ impl Report {
     pub fn form(mut self, form: &Form) -> Self {
         if let Some(template) = &form.template {
             self.template = template.clone();
+        }
+        if let Some(labels) = &form.labels {
+            self.issue_labels = labels.clone();
+        }
+        if let Some(prefix) = &form.title_prefix {
+            self.title_prefix = Some(prefix.clone());
         }
         for field in &form.fields {
             if field.kind.is_answerable() {
@@ -267,6 +281,8 @@ impl Report {
             url,
             body,
             diagnostics,
+            labels: self.issue_labels.clone(),
+            title_prefix: self.title_prefix.clone(),
         })
     }
 
@@ -368,34 +384,77 @@ impl Report {
             }
             #[cfg(feature = "gh-cli")]
             Transport::GhCli => {
-                let title = composed
-                    .title
-                    .clone()
-                    .unwrap_or_else(|| "Bug report".into());
-                let output = std::process::Command::new("gh")
-                    .args([
-                        "issue",
-                        "create",
-                        "--repo",
-                        &composed.destination.slug(),
-                        "--title",
-                        &title,
-                        "--body",
-                        &composed.body,
-                    ])
-                    .output()
-                    .map_err(|err| Error::Spawn {
+                let title = match (&composed.title, &composed.title_prefix) {
+                    (Some(title), _) => title.clone(),
+                    (None, Some(prefix)) => format!("{}Bug report", prefix),
+                    (None, None) => "Bug report".into(),
+                };
+
+                // Pipe the body over stdin via `--body-file -`, so a 32 KB
+                // report doesn't blow the Windows command-line limit and a
+                // local user cannot read it from the process list.
+                let run_gh = |labels: &[String]| -> Result<std::process::Output> {
+                    let mut child = std::process::Command::new("gh")
+                        .args([
+                            "issue",
+                            "create",
+                            "--repo",
+                            &composed.destination.slug(),
+                            "--title",
+                            &title,
+                            // The body over stdin, never in argv.
+                            "--body-file",
+                            "-",
+                        ])
+                        .args(labels.iter().flat_map(|l| ["--label", l]))
+                        .stdin(std::process::Stdio::piped())
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::piped())
+                        .spawn()
+                        .map_err(|err| Error::Spawn {
+                            program: "gh".into(),
+                            source: err,
+                        })?;
+                    // A closed pipe is not an error: `gh` may reject the request
+                    // and exit before draining stdin, and the write we care
+                    // about is the report, which it has already rejected.
+                    if let Some(mut stdin) = child.stdin.take() {
+                        use std::io::Write;
+                        let _ = stdin.write_all(composed.body.as_bytes());
+                    }
+                    child.wait_with_output().map_err(|err| Error::Spawn {
                         program: "gh".into(),
                         source: err,
-                    })?;
-                if !output.status.success() {
-                    return Err(Error::OpenerFailed(
-                        String::from_utf8_lossy(&output.stderr).trim().to_string(),
+                    })
+                };
+
+                // Try with labels first; if a label doesn't exist in the
+                // repo, `gh` fails the whole create. Retry without labels in
+                // that case — a report with the wrong labels beats no report.
+                let output = run_gh(&composed.labels)?;
+                if output.status.success() {
+                    return Ok(Sent::Created(
+                        String::from_utf8_lossy(&output.stdout).trim().to_string(),
                     ));
                 }
-                Ok(Sent::Created(
-                    String::from_utf8_lossy(&output.stdout).trim().to_string(),
-                ))
+
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if !composed.labels.is_empty() && is_missing_label(&stderr) {
+                    // Deliberately narrow. A bare "not found" also covers a
+                    // repository that does not exist, and retrying that would
+                    // re-run a create that may already have succeeded on the
+                    // server — filing the reporter's issue twice because their
+                    // repo is misspelled.
+                    let retry = run_gh(&[])?;
+                    if retry.status.success() {
+                        return Ok(Sent::Created(
+                            String::from_utf8_lossy(&retry.stdout).trim().to_string(),
+                        ));
+                    }
+                    return Err(gh_failed(&retry.stderr));
+                }
+
+                Err(gh_failed(&output.stderr))
             }
             #[cfg(feature = "endpoint")]
             Transport::Endpoint { url, auth } => {
@@ -430,6 +489,37 @@ impl Report {
     }
 }
 
+/// Whether `gh` failed specifically because a label does not exist.
+///
+/// Narrow on purpose. The alternative — treating any "not found" as a missing
+/// label — also catches a repository that does not exist or is misspelled, and
+/// the retry would then re-run a create that may already have landed on the
+/// server. Filing the same issue twice because a repo is misspelled is worse
+/// than filing it unlabelled.
+///
+/// `gh`'s stderr is not a stable interface, so this is a heuristic and not a
+/// contract: it exists to make the common case work, and the unlabelled retry
+/// is the backstop when it does not.
+#[cfg(feature = "gh-cli")]
+fn is_missing_label(stderr: &str) -> bool {
+    let lower = stderr.to_lowercase();
+    lower.contains("label") && (lower.contains("not found") || lower.contains("does not exist"))
+}
+
+/// Classify a failed `gh` invocation, keeping its raw stderr.
+///
+/// The raw text travels with the error because the classification is
+/// best-effort: a `gh` upgrade can change the wording, and a reporter staring
+/// at "gh reported an error" has nothing to act on.
+#[cfg(feature = "gh-cli")]
+fn gh_failed(stderr: &[u8]) -> Error {
+    let stderr = String::from_utf8_lossy(stderr);
+    Error::GhFailed {
+        kind: crate::error::classify_gh_stderr(&stderr),
+        stderr: stderr.trim().to_string(),
+    }
+}
+
 /// An assembled report.
 #[derive(Debug, Clone)]
 pub struct Composed {
@@ -444,6 +534,12 @@ pub struct Composed {
     /// The fenced diagnostics block, when records were attached. Never part of
     /// the URL.
     pub diagnostics: Option<String>,
+    /// Labels to apply to the issue, from the form definition. Only the `gh`
+    /// route uses these; `Browser` gets them through the prefill URL.
+    pub labels: Vec<String>,
+    /// Title prefix from the form (e.g. `[bug] `), for the `gh` route to
+    /// prepend when building the title.
+    pub title_prefix: Option<String>,
 }
 
 /// What happened.
