@@ -1900,3 +1900,145 @@ mod tests {
         assert_gone(&redactor, "cat ~someone/.bashrc", "someone");
     }
 }
+
+// ── The differential corpus (issue #5, step one) ──
+//
+// The five rewrites of `mask_hosts` each fixed the previous round's defect and
+// opened another one next door. Every one was found by a fresh adversarial
+// review; **none was found by the tests the previous round had written.** Each
+// round added a unit assertion for its own motivating example, and none added
+// an invariant that would have predicted the next round.
+//
+// So the corpus is differential and it is checked in both directions, over real
+// strings rather than the one case that motivated a change:
+//
+//   SURVIVORS  — module paths, bundle ids and filenames. Masking one costs a
+//                round trip on the single most useful line in a bug report.
+//   HOSTS      — names that identify a private network. Publishing one does not
+//                come back.
+//
+// Run against the rule as it stands, this is the measurement that says which
+// way the residual errors fall. It reports one false negative and no false
+// positives over the real corpus, and that false negative is a documented
+// decision rather than an oversight — see `mask_hosts` and #5.
+//
+// What it deliberately does NOT do is assert a generative
+// `{host|package}.{case}.{suffix}` invariant. Measured, that grid is
+// unsatisfiable by any context-free rule: `bastion.com` and `foo.tar.gz` are the
+// same two-label shape, and the rule must keep one while masking the other. The
+// discriminator is not shape but position and field provenance, which is the
+// redesign #5 asks for rather than a patch on top of the prior.
+#[cfg(test)]
+mod host_corpus {
+    use super::*;
+
+    fn redactor() -> Redactor {
+        Redactor::with_identity(Some("/Users/testuser".into()), Some("testuser".into()))
+    }
+
+    fn masked(input: &str) -> bool {
+        let out = redactor().scrub(input);
+        out.contains("<host>") || out.contains("<ip>")
+    }
+
+    /// Module paths, bundle ids and filenames. Every one has exactly the shape
+    /// of a hostname, which is the whole difficulty.
+    const SURVIVORS: &[&str] = &[
+        // Python
+        "os.path.join",
+        "django.db.models",
+        "django.contrib.auth.models",
+        "celery.utils.collections",
+        // Java / Kotlin
+        "at java.lang.Thread.run",
+        "com.example.Main",
+        "java.util.concurrent.FutureTask",
+        "com.google.common.base.Strings",
+        "io.netty.internal.PlatformDependent",
+        "kotlin.internal.PlatformDependent",
+        "org.jetbrains.kotlin.cli.jvm.K2JVMCompiler",
+        // Private suffix as a package segment — the case that broke rounds 2, 3
+        // and 5. `internal` is a Kotlin visibility keyword and a routine Java
+        // package segment, so it appears in both roles.
+        "com.acme.internal.util",
+        "com.acme.internal.Impl",
+        "com.acme.internal-tools.util.Client",
+        // Filenames that end in something shaped like a TLD
+        "webpack.config.prod.js",
+        "config.yml.bak",
+        "config.yml.dev",
+        "foo.tar.gz",
+        "lib.rs.orig",
+        "some.package.name.systems",
+        // Reverse-DNS / bundle identifiers
+        "com.apple.dock.app",
+        "uk.co.example.service",
+        "io.grpc.okhttp",
+    ];
+
+    /// Names that identify a private network. A mix of the shapes the five
+    /// rounds actually broke on, so a regression names the round it undoes.
+    const HOSTS: &[&str] = &[
+        // Round 3 opened these.
+        "bastion.corp",
+        "bastion.corp.acme-inc",
+        "vault.internal",
+        // Round 4 opened these: a capitalised AD hostname, and a leading TLD.
+        "Bastion.internal.acme-inc",
+        "int.acme.corp",
+        // Round 5 opened these: a shouted TLD, and a ccTLD that is also a
+        // reverse-DNS root.
+        "bastion.internal.acme.NET",
+        "us.internal.acme.com",
+        // Position: a private label mid-run in a run ending in a private
+        // suffix. A hostname ENDS with its suffix; a package BEGINS with one.
+        "db01.corp.acme.corp",
+        "io.corp.acme-inc",
+        "gitlab.intranet",
+        "db.lan",
+        "cache.private",
+        "in-addr.arpa",
+        // The `local` relaxation, where the leading label looks like a machine.
+        "alices-macbook.local",
+        "web-3.local",
+        "print-01.internal",
+    ];
+
+    #[test]
+    fn no_module_path_is_masked() {
+        for input in SURVIVORS {
+            assert!(
+                !masked(input),
+                "{input:?} is a module path and must survive"
+            );
+        }
+    }
+
+    #[test]
+    fn no_private_host_is_published() {
+        for input in HOSTS {
+            assert!(masked(input), "{input:?} names a private network");
+        }
+    }
+
+    /// The decision this corpus exists to make visible.
+    ///
+    /// `.local` at two labels is relaxed unless the leading label looks like a
+    /// machine, because `config.local` and `settings.local` are in every Vite,
+    /// Next and Django project there is. The cost is a bare `printer.local`
+    /// surviving — a real leak, kept deliberately, and named at `mask_hosts`.
+    ///
+    /// Asserted as its own test rather than left implicit in the two above: it
+    /// is the one place the rule is knowingly wrong, so a change to either side
+    /// of the trade has to be deliberate. If the fix in #5 closes it, this test
+    /// is what changes.
+    #[test]
+    fn the_local_relaxation_costs_a_bare_two_label_host() {
+        assert!(masked("alices-macbook.local"), "machine-shaped: masked");
+        assert!(
+            !masked("printer.local"),
+            "word-shaped: survives, by decision"
+        );
+        assert!(!masked("config.local"), "the case the relaxation protects");
+    }
+}
