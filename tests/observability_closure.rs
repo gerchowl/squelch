@@ -116,14 +116,14 @@ fn id() -> impl Strategy<Value = String> {
 
 /// Values biased toward the URL budget rather than sampled uniformly.
 ///
-/// `MAX_URL_LEN` is 7 500 characters. Drawing lengths evenly would put almost
+/// `MAX_URL_LEN` is 4 200 characters. Drawing lengths evenly would put almost
 /// every case far below it, and the boundary — where truncation and dropping
 /// happen — would essentially never be reached.
 fn value() -> impl Strategy<Value = String> {
     prop_oneof![
         4 => "[a-zA-Z0-9 .,:/'\"<>&%~-]{0,80}".prop_map(String::from),
-        3 => (1usize..9_000).prop_map(|n| "x".repeat(n)),
-        2 => (1usize..3_000).prop_map(|n| "é".repeat(n)),
+        3 => (1usize..6_000).prop_map(|n| "x".repeat(n)),
+        2 => (1usize..2_000).prop_map(|n| "é".repeat(n)),
         1 => Just(String::new()),
     ]
 }
@@ -160,9 +160,9 @@ fn competing_fields() -> impl Strategy<Value = Vec<Op>> {
         (
             id(),
             prop_oneof![
-                (2_000usize..6_000).prop_map(|n| "x".repeat(n)),
+                (1_500usize..5_000).prop_map(|n| "x".repeat(n)),
                 (1usize..200).prop_map(|n| "y".repeat(n)),
-                (500usize..2_500).prop_map(|n| "é".repeat(n)),
+                (500usize..2_000).prop_map(|n| "é".repeat(n)),
             ],
         ),
         2..5,
@@ -180,7 +180,7 @@ fn competing_fields() -> impl Strategy<Value = Vec<Op>> {
 /// Restating it is the point: if the crate raises its budget without this
 /// following, the coverage assertion below starts failing, which is the right
 /// way round — a silent divergence would make the assertion vacuous instead.
-const MAX_URL_LEN: usize = 7_500;
+const MAX_URL_LEN: usize = 4_200;
 
 /// The observable result of a sequence: everything a surface can see, and
 /// everything that decides what the reporter believes they are sending.

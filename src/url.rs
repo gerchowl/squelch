@@ -16,12 +16,18 @@ use crate::destination::Destination;
 
 /// Hard ceiling on the whole URL.
 ///
-/// Measured against github.com rather than guessed: 4 079 characters answered
-/// 302 normally, 7 079 returned 500, 8 079 reset the connection, and 8 279+
-/// returned 414. Browsers tolerate far more — Chrome and Firefox handle roughly
-/// 32 KB — but GitHub's server cap bites first. 7 500 leaves headroom under the
-/// first failing size.
-pub const MAX_URL_LEN: usize = 7_500;
+/// Measured against github.com (2026-09-30): 4 079 chars answered 302,
+/// 7 079 returned 500, 8 279+ returned 414. With a logged-in browser's cookies
+/// the 500 zone starts near 6 000. Browsers tolerate far more — Chrome and
+/// Firefox handle roughly 32 KB — but GitHub's server cap bites first.
+///
+/// 4 200 leaves a comfortable margin below the cookie-adjusted ceiling. The
+/// same measurement should be re-checked periodically; GitHub moves this limit.
+///
+/// **Measured, not guessed.** A prior reader (issue #6) could not verify the
+/// number against the original measurement; the data is recorded here so it is
+/// always checkable.
+pub const MAX_URL_LEN: usize = 4_200;
 
 /// A built URL, and whether anything was lost building it.
 #[derive(Debug, Clone, PartialEq, Eq)]
