@@ -40,9 +40,10 @@ assertion is on the payload rather than on the intent to send.
 | route | receiver | why this shape |
 | --- | --- | --- |
 | `Browser` | `open`/`xdg-open` shim on the child's `PATH` | captures the exact URL a browser would get, which is where the "no diagnostics in the query string" promise lives |
-| `GhCli` | a fake `gh` recording its argv | squelch never calls the GitHub API on this route — it spawns `gh`, which holds the credential. Mocking the API would test `gh` |
+| `GhCli` | a fake `gh` recording its argv and stdin | squelch never calls the GitHub API on this route — it spawns `gh`, which holds the credential. Mocking the API would test `gh` |
 | `Endpoint` | a loopback `TcpListener` | captures the real POST including headers, since a credential in a header leaks as thoroughly as one in a body |
 | `File`, `Mailto` | the artefact itself | the mailto URL is percent-decoded before asserting, or a leaked path hides behind `%2F` |
+| panic hook | a subprocess that dies | a panic inside a panic hook **aborts**, so the properties that matter cannot be observed from inside the test binary at all — see below |
 
 No new dependencies and no container: the HTTP receiver is about forty lines of
 `std::net`, and the shims are `sh` scripts. That is what lets the whole suite
@@ -53,6 +54,34 @@ no container runtime.
 parallel threads, and a racing `set_var` corrupts the environment badly enough
 that the panic machinery itself fails — turning an ordinary assertion failure
 into an unreadable abort.
+
+## A test that had to be a subprocess
+
+`e2e_panic.rs` drives the demo's `panic` subcommand and asserts on its exit status
+and its stderr. It could not be written any other way, and the reason is a
+property of the code under test rather than a testing preference.
+
+**A panic inside a panic hook aborts the process.** So the question "does the
+original panic message still reach the terminal when the application's callback
+also fails?" can only be answered by watching a process die. An in-process
+`catch_unwind` takes the test binary with it, which is the failure mode this
+document has already been bitten by twice.
+
+And the answer was **no**, until it was. The hook originally composed the report,
+called the callback, and *then* chained to the previous hook — the natural order,
+since composing first means a report exists even if delivery fails. But delivery
+failing is an abort, so the previous hook never ran and the original message was
+gone. The user had a crash, and a crash reporter that swallowed the crash.
+
+The order is now reversed: chain first, compose second. The cost is that a
+panicking callback loses the report. The alternative loses the crash, and a
+reporter that eats the thing it exists to report is worse than one that loses
+its own output.
+
+This is the second time in this repo that a property was only observable from
+outside the process — the first was the property suite asserting nothing, which
+had the same shape and the same cause: an assertion that cannot fail is not an
+assertion.
 
 ## The canary corpus
 

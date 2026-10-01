@@ -96,6 +96,25 @@ enum Route {
         #[arg(long)]
         token: Option<String>,
     },
+    /// Crash, with a panic hook installed, and print what the hook composed.
+    ///
+    /// Exists to be driven. The end-to-end test runs this as a subprocess and
+    /// asserts that a report was composed, that it was scrubbed, and that
+    /// **nothing was sent** — the last of which is the crate's one rule and the
+    /// reason the hook composes rather than transmits.
+    ///
+    /// `--callback-panics` makes the application's own callback fail too, which
+    /// aborts the process. That is `std`'s behaviour rather than this crate's,
+    /// and it is only observable from outside: an in-process `catch_unwind`
+    /// would take the test binary with it.
+    Panic {
+        /// The panic message, so the test can plant a canary in it.
+        #[arg(long, default_value = "something went wrong")]
+        message: String,
+        /// Panic again inside the hook's callback.
+        #[arg(long)]
+        callback_panics: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -148,6 +167,35 @@ fn form() -> squelch::Form {
 
 fn run() -> Result<String, Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+
+    // Before anything else, and before the redactor exists, because the hook
+    // needs one: a crash on any path below should still produce a report.
+    if let Route::Panic {
+        message,
+        callback_panics,
+    } = &cli.route
+    {
+        // Copied, not borrowed: the hook closure is `'static`, because it is
+        // installed process-globally and may outlive this scope. A reference to
+        // the parsed arguments would not live long enough, and borrowing is what
+        // would make this look impossible rather than merely awkward.
+        let callback_panics = *callback_panics;
+        squelch::panic::install_with(Redactor::new(), move |report| {
+            if callback_panics {
+                // Deliberate. A panic inside a panic hook aborts the process,
+                // and the e2e test asserts that the *original* message still
+                // reached stderr first.
+                panic!("the application's callback failed too");
+            }
+            // Compose and print. Never send: the process is panicking, and
+            // nothing has asked a human to approve this.
+            eprintln!("--- squelch: report composed from the panic ---");
+            eprintln!("{}", report.preview().unwrap_or_default());
+            eprintln!("--- end of composed report ---");
+        });
+        panic!("{message}");
+    }
+
     let redactor = Redactor::new();
 
     // Answered before anything is collected: neither surface reads a log file
@@ -238,7 +286,9 @@ fn run() -> Result<String, Box<dyn std::error::Error>> {
         // Returned above. Listed rather than caught by a wildcard so that
         // adding a route cannot silently acquire a transport it never meant
         // to have — the agent surface in particular must never reach one.
-        Route::Schema | Route::Compose { .. } => unreachable!("handled before collection"),
+        Route::Schema | Route::Compose { .. } | Route::Panic { .. } => {
+            unreachable!("handled before collection")
+        }
     };
 
     // `.form(&form())` rather than restating the template: the form is the one

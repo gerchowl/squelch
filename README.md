@@ -163,8 +163,28 @@ A missing `Shell:` line leaves a triager unable to tell "this reporter has no `S
 | `logs` | yes | JSONL extraction (`serde_json`) |
 | `gh-cli` | no | create the issue with `gh` — no dependencies |
 | `endpoint` | no | POST to an endpoint you operate (`ureq`, `serde_json`) |
+| `panic-hook` | no | compose a report from a crash — no dependencies |
 | `schema` | no | `Form::json_schema()` for an agent tool surface (`serde_json`) |
 | `serde` | no | derive serde on `Form`, so you can load it from your own YAML/JSON/TOML |
+
+### When it crashes
+
+`panic-hook` is the reason most projects reach for a crate like this. It chains to
+whatever hook was already installed and hands you a `Report` — **it never sends**,
+because a panic hook runs while the process is failing, and opening a browser
+from there is how a bug report becomes the reason a bug is unreportable.
+
+```rust
+let _ = squelch::panic::install(|report| {
+    // Compose and print. Sending is your decision, made after the unwind.
+    eprintln!("{}", report.preview().unwrap_or_default());
+});
+```
+
+The panic message and location go through the same `Redactor` as everything else,
+because a panic message is exactly where a path or a token ends up by accident.
+Behind a feature because `set_hook` displaces process-global state: that should be
+a decision, not a side effect of depending on the crate.
 
 With `default-features = false` the dependencies are `regex`, plus `libc` on Unix — the scrubber falls back to `getpwuid` when a service manager has stripped `HOME` and `USER`, which is precisely when it would otherwise stop recognising the paths it's there to mask. It still redacts, builds URLs and renders bodies.
 

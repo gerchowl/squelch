@@ -94,6 +94,16 @@ logs = ["dep:serde_json"]
 endpoint = ["dep:ureq", "dep:serde_json"]
 # Submit with the `gh` CLI when it is installed and authenticated.
 gh-cli = []
+# A panic hook that composes a report and hands it to the application, which
+# decides what happens to it. No new dependencies — `std::panic` and this
+# crate's own redactor.
+#
+# Behind a feature because it *replaces process-global state*. A consumer that
+# never opts in gets no hook installed and no way to notice, which is the
+# correct default: `set_hook` silently displaces an application's own crash
+# handling, and that should be a decision rather than a side effect of depending
+# on the crate.
+panic-hook = []
 # `Form::json_schema` for an agent-tool surface. Its own feature rather than a
 # corner of `logs`: an agent surface wants the schema and has no reason to want
 # JSONL log parsing, and the return type is `serde_json::Value`, so a consumer
