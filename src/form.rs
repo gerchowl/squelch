@@ -160,6 +160,12 @@ pub struct Form {
         serde(default, skip_serializing_if = "Option::is_none")
     )]
     pub title_prefix: Option<String>,
+    /// Labels the template sets on every issue it creates.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub labels: Option<Vec<String>>,
     /// The fields, in the order a surface should present them.
     pub fields: Vec<Field>,
 }
@@ -170,6 +176,7 @@ impl Form {
         Self {
             template: None,
             title_prefix: None,
+            labels: None,
             fields: fields.into_iter().collect(),
         }
     }
@@ -178,6 +185,29 @@ impl Form {
     /// browser route has no form to open.
     pub fn template(mut self, template: impl Into<String>) -> Self {
         self.template = Some(template.into());
+        self
+    }
+
+    /// Labels every issue created from this form should carry.
+    ///
+    /// GitHub's own `labels:` in the issue-form YAML, mirrored so a
+    /// [`crate::Form`] built in Rust says the same thing as one read from the
+    /// file. The browser route gets them from GitHub itself; a route that
+    /// creates the issue directly — `gh` — has to apply them, or an issue filed
+    /// that way arrives unlabelled and misses every triage query keyed on the
+    /// label.
+    pub fn labels<I, S>(mut self, labels: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.labels = Some(labels.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// A prefix for the issue title, e.g. `[bug] `.
+    pub fn title_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.title_prefix = Some(prefix.into());
         self
     }
 
@@ -416,6 +446,9 @@ pub mod github {
         pub description: Option<String>,
         /// A title prefix, e.g. `[bug] `.
         pub title: Option<String>,
+        /// Labels the template sets on every issue.
+        #[serde(default)]
+        pub labels: Option<Vec<String>>,
         /// The elements, in the order the reporter meets them.
         pub body: Vec<Element>,
     }
@@ -627,6 +660,7 @@ pub mod github {
             Form {
                 template: None,
                 title_prefix: source.title,
+                labels: source.labels,
                 fields,
             }
         }

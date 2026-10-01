@@ -128,6 +128,8 @@ pub mod transport;
 pub mod url;
 
 pub use destination::{Destination, DestinationError};
+#[cfg(feature = "gh-cli")]
+pub use error::GhErrorKind;
 pub use error::{Error, Result};
 pub use form::{Field, FieldKind, Form};
 pub use provenance::{Provenance, Value};

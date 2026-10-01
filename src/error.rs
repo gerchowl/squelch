@@ -48,6 +48,91 @@ pub enum Error {
     /// link that only resolves under one feature breaks `cargo doc` on every
     /// other.
     Auth(String),
+    /// The `gh` CLI reported a failure after the process was started.
+    #[cfg(feature = "gh-cli")]
+    GhFailed {
+        /// A best-effort classification of what went wrong.
+        kind: GhErrorKind,
+        /// The raw stderr, for debugging.
+        stderr: String,
+    },
+}
+
+/// Best-effort classification of a `gh` failure.
+#[cfg(feature = "gh-cli")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GhErrorKind {
+    /// `gh` could not authenticate — token expired, not logged in, or missing scope.
+    NotAuthenticated,
+    /// `gh` does not have permission to write to the target repository.
+    Forbidden,
+    /// The target repository was not found.
+    NotFound,
+    /// Something else — the full stderr is in [`Error::GhFailed`].
+    Other,
+}
+
+#[cfg(feature = "gh-cli")]
+impl fmt::Display for GhErrorKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotAuthenticated => write!(
+                f,
+                "gh is not authenticated or your token is missing the 'repo' scope"
+            ),
+            Self::Forbidden => write!(f, "gh does not have permission to write to this repository"),
+            Self::NotFound => write!(f, "the target repository was not found"),
+            Self::Other => write!(f, "gh reported an error"),
+        }
+    }
+}
+
+/// Classify the raw stderr from a failed `gh` invocation.
+///
+/// Best-effort only — `gh`'s stderr is not a stable interface, and a `gh`
+/// upgrade can change any of these strings. The raw text is preserved in
+/// [`Error::GhFailed`] so the reporter can read it even if the classification
+/// misses, and an unrecognised failure is [`GhErrorKind::Other`] rather than a
+/// confident wrong answer.
+///
+/// The three classified cases are the ones that need *different remedies*.
+/// Reporting "not logged in" as "your token cannot write here" sends the
+/// reporter off to re-authenticate a token that was already fine, and the
+/// reverse wastes their time on a token that will never work. Verified against
+/// `gh` 2.94 wording.
+#[cfg(feature = "gh-cli")]
+pub fn classify_gh_stderr(stderr: &str) -> GhErrorKind {
+    let lower = stderr.to_lowercase();
+
+    // Not authenticated. Ahead of the others because a missing token makes `gh`
+    // fall through to a generic message that also names the repository.
+    if lower.contains("not logged in")
+        || lower.contains("not logged into")
+        || lower.contains("could not authenticate")
+        || lower.contains("authentication required")
+        || lower.contains("gh_token")
+        || lower.contains("bad credentials")
+    {
+        return GhErrorKind::NotAuthenticated;
+    }
+    // Forbidden. GitHub's own wording is "Resource not accessible by
+    // integration", and `gh` prints the GraphQL message verbatim.
+    if lower.contains("forbidden")
+        || lower.contains("not authorized")
+        || lower.contains("resource not accessible")
+        || lower.contains("must have write access")
+        || lower.contains("permission to")
+    {
+        return GhErrorKind::Forbidden;
+    }
+    // Not found — the GraphQL error for a missing repo, or a typo in the slug.
+    if lower.contains("could not resolve to a repository")
+        || lower.contains("could not resolve to a user")
+        || lower.contains("not found")
+    {
+        return GhErrorKind::NotFound;
+    }
+    GhErrorKind::Other
 }
 
 impl fmt::Display for Error {
@@ -82,6 +167,10 @@ impl fmt::Display for Error {
                 None => write!(f, "endpoint request failed: {message}"),
             },
             Self::Auth(message) => write!(f, "could not build credentials: {message}"),
+            #[cfg(feature = "gh-cli")]
+            Self::GhFailed { kind, stderr } => {
+                write!(f, "{kind}:\n{stderr}")
+            }
         }
     }
 }
@@ -92,6 +181,8 @@ impl std::error::Error for Error {
             Self::Destination(err) => Some(err),
             Self::Spawn { source, .. } => Some(source),
             Self::Io(err) => Some(err),
+            #[cfg(feature = "gh-cli")]
+            Self::GhFailed { .. } => None,
             _ => None,
         }
     }
@@ -123,5 +214,84 @@ mod tests {
     fn confirmation_error_says_what_to_do() {
         let err = Error::ConfirmationRequired("POST the report".into());
         assert!(err.to_string().contains(".confirmed()"));
+    }
+
+    /// The classifications that need *different remedies* must not collapse
+    /// into one another.
+    ///
+    /// Every string below is `gh` 2.94's own wording, captured rather than
+    /// invented. The whole point of splitting these out is that "re-authenticate"
+    /// and "your token cannot write here" send the reporter somewhere useless,
+    /// so a change to the patterns has to be a decision rather than a quiet
+    /// regression to `Other` — which is what a bare "the message changed" test
+    /// would let through.
+    #[cfg(feature = "gh-cli")]
+    #[test]
+    fn gh_failures_classify_into_the_three_cases_that_need_different_fixes() {
+        for (stderr, expected) in [
+            (
+                "gh: To use GitHub CLI in a GitHub Actions workflow, set the GH_TOKEN environment variable.",
+                GhErrorKind::NotAuthenticated,
+            ),
+            ("You are not logged into any GitHub hosts. Run gh auth login", GhErrorKind::NotAuthenticated),
+            ("could not authenticate: bad credentials", GhErrorKind::NotAuthenticated),
+            (
+                "GraphQL: Resource not accessible by integration (repository)",
+                GhErrorKind::Forbidden,
+            ),
+            ("HTTP 403: Forbidden", GhErrorKind::Forbidden),
+            ("must have write access to this repository", GhErrorKind::Forbidden),
+            (
+                "GraphQL: Could not resolve to a Repository with the name 'gerchowl/nope'. (repository)",
+                GhErrorKind::NotFound,
+            ),
+            ("could not add label: \"nope\" not found", GhErrorKind::NotFound),
+            ("something nobody has seen before", GhErrorKind::Other),
+        ] {
+            assert_eq!(
+                classify_gh_stderr(stderr),
+                expected,
+                "classified wrongly: {stderr}"
+            );
+        }
+    }
+
+    /// The raw stderr survives the classification.
+    ///
+    /// A reporter staring at "gh reported an error" with nothing else has no
+    /// way to act, and the classification is a heuristic over a string `gh`
+    /// does not promise to keep. So the original text always travels with it.
+    #[cfg(feature = "gh-cli")]
+    #[test]
+    fn an_unclassified_gh_failure_still_carries_its_stderr() {
+        let stderr = "gh: the widget subsystem melted (exit 3)";
+        let err = Error::GhFailed {
+            kind: classify_gh_stderr(stderr),
+            stderr: stderr.into(),
+        };
+        assert_eq!(err.to_string(), format!("gh reported an error:\n{stderr}"));
+    }
+
+    /// A failure on a route with no browser must not read as a browser
+    /// failure. That was the original defect: every non-zero `gh` exit became
+    /// `OpenerFailed`, whose text is *"the browser opener failed"*, so all three
+    /// of these read as a browser problem on a route that never opens one.
+    #[cfg(feature = "gh-cli")]
+    #[test]
+    fn a_gh_failure_is_not_reported_as_a_browser_failure() {
+        for stderr in [
+            "You are not logged into any GitHub hosts.",
+            "GraphQL: Resource not accessible by integration (repository)",
+            "GraphQL: Could not resolve to a Repository with the name 'a/b'.",
+        ] {
+            let err = Error::GhFailed {
+                kind: classify_gh_stderr(stderr),
+                stderr: stderr.into(),
+            };
+            assert!(
+                !err.to_string().contains("browser"),
+                "a gh failure must not blame the browser: {stderr}"
+            );
+        }
     }
 }
