@@ -8,9 +8,9 @@
 //!
 //! # The guarantees, and where they are lost
 //!
-//! | route | validates the form | human reviews before send | needs a credential |
+//! | route | validates the form | human reviews before send | needs a credential? |
 //! | --- | --- | --- | --- |
-//! | `Browser` | yes — GitHub's own | yes — the form *is* the review | no |
+//! | `Browser` | yes — GitHub's own | yes — before submit; no — URL disclosed on open | no (see [`crate::url`]) |
 //! | `Endpoint` | no | only if you confirm first | server-side |
 //! | `GhCli` | no | only if you confirm first | the user's `gh` |
 //! | `Mailto` | no | yes — their mail client | no |
@@ -21,8 +21,10 @@
 //! a human. That is not a bug in this crate — it is what the GitHub API does —
 //! but it means a form is advisory on every route except `Browser`.
 //!
-//! Because `Browser` is the only route where the review surface is built in,
-//! [`crate::Report::send`] requires an explicit confirmation on the others.
+//! `Browser` is the only route where the review surface is built in, but the
+//! URL — including the reporter's prose — reaches github.com the moment the
+//! browser opens ([`crate::url`]). The crate already keeps diagnostics out of
+//! the URL for that reason; the table above now states it explicitly.
 
 use std::path::PathBuf;
 
